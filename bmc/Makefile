@@ -37,9 +37,9 @@ CFLAGS += -I.
 CFLAGS += -I$(LINUX_LIB_PATH)
 CFLAGS += -I$(LINUX_TOOLS_PATH)/include/uapi
 
-LDFLAGS ?= -L$(LIBBPF_PATH) -l:libbpf.a -lelf $(USER_LIBS)
+LDFLAGS ?= -L$(LIBBPF_PATH) -lz -l:libbpf.a -lelf $(USER_LIBS)
 
-NOSTDINC_FLAGS := -nostdinc -isystem /usr/lib/gcc/x86_64-linux-gnu/13/include
+NOSTDINC_FLAGS := -nostdinc -isystem /usr/lib/gcc/x86_64-linux-gnu/13/include -fcf-protection
 
 ARCH=$(shell uname -m | sed 's/x86_64/x86/' | sed 's/i386/x86/')
 
@@ -49,6 +49,7 @@ LINUXINCLUDE += -I$(LINUX_PATH)/arch/$(ARCH)/include/generated
 LINUXINCLUDE += -I$(LINUX_PATH)/arch/$(ARCH)/include/generated/uapi
 LINUXINCLUDE += -I$(LINUX_PATH)/include
 LINUXINCLUDE += -I$(LINUX_PATH)/include/uapi
+LINUXINCLUDE += -I$(LINUX_TOOLS_PATH)/lib
 LINUXINCLUDE += -I$(LINUX_PATH)/include/generated/uapi
 LINUXINCLUDE += -I$(LINUX_PATH)/tools/testing/selftests/bpf
 LINUXINCLUDE += -include $(LINUX_PATH)/include/linux/kconfig.h
