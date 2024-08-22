@@ -21,8 +21,8 @@ LIBBPF_PATH = $(LINUX_LIB_PATH)/bpf
 
 TARGETS += bmc
 
-CLANG ?= clang-9
-LLC ?= llc-9
+CLANG ?= clang-18
+LLC ?= llc-18
 CC := gcc
 
 KERN_SOURCES = ${TARGETS:=_kern.c}
@@ -39,7 +39,8 @@ CFLAGS += -I$(LINUX_TOOLS_PATH)/include/uapi
 
 LDFLAGS ?= -L$(LIBBPF_PATH) -l:libbpf.a -lelf $(USER_LIBS)
 
-NOSTDINC_FLAGS := -nostdinc -isystem $(shell $(CC) -print-file-name=include)
+NOSTDINC_FLAGS := -nostdinc -isystem /usr/lib/gcc/x86_64-linux-gnu/13/include
+
 ARCH=$(shell uname -m | sed 's/x86_64/x86/' | sed 's/i386/x86/')
 
 LINUXINCLUDE := -I$(LINUX_PATH)/arch/$(ARCH)/include

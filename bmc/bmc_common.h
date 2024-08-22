@@ -13,6 +13,10 @@
 #define _BMC_COMMON_H
 
 #include <linux/bpf.h>
+#include <linux/in.h>
+#include <linux/byteorder/generic.h>
+#include <string.h>
+#include <linux/pkt_cls.h>
 
 #define BMC_MAX_KEY_LENGTH 250
 #define BMC_MAX_VAL_LENGTH 1000
