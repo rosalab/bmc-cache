@@ -12,6 +12,8 @@
 #ifndef _BMC_COMMON_H
 #define _BMC_COMMON_H
 
+#include <linux/bpf.h>
+
 #define BMC_MAX_KEY_LENGTH 250
 #define BMC_MAX_VAL_LENGTH 1000
 #define BMC_MAX_ADDITIONAL_PAYLOAD_BYTES 53

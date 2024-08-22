@@ -40,7 +40,7 @@ struct memcached_udp_header {
 /* cache */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__type(key, u32);
+	__type(key, __u32);
 	__type(value, struct bmc_cache_entry);
 	__uint(max_entries, BMC_CACHE_ENTRY_COUNT);
 } map_kcache SEC(".maps");
@@ -48,7 +48,7 @@ struct {
 
 /* keys */
 struct memcached_key {
-	u32 hash;
+	__u32 hash;
 	char data[BMC_MAX_KEY_LENGTH];
 	unsigned int len;
 };
@@ -67,41 +67,42 @@ struct parsing_context {
 	unsigned short read_pkt_offset;
 	unsigned short write_pkt_offset;
 };
-struct bpf_map_def SEC("maps") map_parsing_context = {
-	.type = BPF_MAP_TYPE_PERCPU_ARRAY,
-	.key_size = sizeof(unsigned int),
-	.value_size = sizeof(struct parsing_context),
-	.max_entries = 1,
-};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, unsigned int);
+	__type(value, struct parsing_context);
+} map_parsing_context SEC(".maps");
 
 /* stats */
-struct bpf_map_def SEC("maps") map_stats = {
-	.type = BPF_MAP_TYPE_PERCPU_ARRAY,
-	.key_size = sizeof(unsigned int),
-	.value_size = sizeof(struct bmc_stats),
-	.max_entries = 1,
-};
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, unsigned int);
+	__type(value, struct bmc_stats);
+} map_stats SEC(".maps");
 
 /* program maps */
-struct bpf_map_def SEC("maps") map_progs_xdp = {
-	.type = BPF_MAP_TYPE_PROG_ARRAY,
-	.key_size = sizeof(u32),
-	.value_size = sizeof(u32),
-	.max_entries = BMC_PROG_XDP_MAX,
-};
+struct {
+	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+	__uint(max_entries, BMC_PROG_XDP_MAX);
+	__type(key, __u32);
+	__type(value, __u32);
+} map_progs_xdp SEC(".maps");
 
-struct bpf_map_def SEC("maps") map_progs_tc = {
-	.type = BPF_MAP_TYPE_PROG_ARRAY,
-	.key_size = sizeof(u32),
-	.value_size = sizeof(u32),
-	.max_entries = BMC_PROG_TC_MAX,
-};
+struct {
+	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+	__uint(max_entries, BMC_PROG_TC_MAX);
+	__type(key, __u32);
+	__type(value, __u32);
+} map_progs_tc SEC(".maps");
 
 
-static inline u16 compute_ip_checksum(struct iphdr *ip)
+static inline __u16 compute_ip_checksum(struct iphdr *ip)
 {
-    u32 csum = 0;
-    u16 *next_ip_u16 = (u16 *)ip;
+    __u32 csum = 0;
+    __u16 *next_ip_u16 = (__u16 *)ip;
 
     ip->check = 0;
 
@@ -232,7 +233,7 @@ int bmc_hash_keys_main(struct xdp_md *ctx)
 		return XDP_PASS;
 	}
 
-	u32 cache_idx = key->hash % BMC_CACHE_ENTRY_COUNT;
+	__u32 cache_idx = key->hash % BMC_CACHE_ENTRY_COUNT;
 	struct bmc_cache_entry *entry = bpf_map_lookup_elem(&map_kcache, &cache_idx);
 	if (!entry) { // should never happen since cache map is of type BPF_MAP_TYPE_ARRAY
 		return XDP_PASS;
@@ -341,7 +342,7 @@ int bmc_write_reply_main(struct xdp_md *ctx)
 	}
 
 	unsigned int cache_hit = 1, written = 0;
-	u32 cache_idx = key->hash % BMC_CACHE_ENTRY_COUNT;
+	__u32 cache_idx = key->hash % BMC_CACHE_ENTRY_COUNT;
 	struct bmc_cache_entry *entry = bpf_map_lookup_elem(&map_kcache, &cache_idx);
 	if (!entry) {
 		return XDP_DROP;
@@ -448,7 +449,7 @@ int bmc_invalidate_cache_main(struct xdp_md *ctx)
 		return XDP_PASS;
 	}
 
-	u32 hash;
+	__u32 hash;
 	int set_found = 0, key_found = 0;
 
 #pragma clang loop unroll(disable)
@@ -472,7 +473,7 @@ int bmc_invalidate_cache_main(struct xdp_md *ctx)
 		}
 		else if (key_found == 1) {
 			if (payload[off] == ' ') { // found the end of the key
-				u32 cache_idx = hash % BMC_CACHE_ENTRY_COUNT;
+				__u32 cache_idx = hash % BMC_CACHE_ENTRY_COUNT;
 				struct bmc_cache_entry *entry = bpf_map_lookup_elem(&map_kcache, &cache_idx);
 				if (!entry) {
 					return XDP_PASS;
@@ -545,7 +546,7 @@ int bmc_update_cache_main(struct __sk_buff *skb)
 	char *payload = (data + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + sizeof(struct memcached_udp_header));
 	unsigned int zero = 0;
 
-	u32 hash = FNV_OFFSET_BASIS_32;
+	__u32 hash = FNV_OFFSET_BASIS_32;
 
 	// compute the key hash
 #pragma clang loop unroll(disable)
@@ -554,7 +555,7 @@ int bmc_update_cache_main(struct __sk_buff *skb)
 		hash *= FNV_PRIME_32;
 	}
 
-	u32 cache_idx = hash % BMC_CACHE_ENTRY_COUNT;
+	__u32 cache_idx = hash % BMC_CACHE_ENTRY_COUNT;
 	struct bmc_cache_entry *entry = bpf_map_lookup_elem(&map_kcache, &cache_idx);
 	if (!entry) {
 		return TC_ACT_OK;
