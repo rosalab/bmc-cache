@@ -24,13 +24,13 @@ BMC must be compiled with libbpf and other header files obtained from kernel sou
 These scripts require the following software to be installed:
 
 ```sh
-gpg curl tar xz make gcc flex bison libssl-dev libelf-dev
+gpg curl tar make gcc flex bison libssl-dev libelf-dev
 ```
 
 The project uses llvm and clang version 9 to build BMC, but more recent versions might work as well:
 
 ```sh
-llvm-9 clang-9
+llvm-18 clang-18
 ```
 
 Note that ```libelf-dev``` is also required to build libbpf and BMC.
@@ -46,10 +46,10 @@ After BMC has been successfully built, kernel sources can be removed by running 
 
 ### Building Memcached-SR
 
-Memcached-SR is based on memcached v1.5.19. Building it requires the following software:
+I basically added latest Github Memached as a submodule.
 
 ```sh
-clang-9 (or gcc-9) automake libevent-dev
+clang-18 (or gcc-18) automake libevent-dev
 ```
 
 Either ```clang-9``` or ```gcc-9``` is required in order to compile memcached without linking issues. Depending on your distribution, you might also need to use the ```-Wno-deprecated-declarations``` compilation flag.
@@ -58,7 +58,7 @@ Memcached-SR can be built with the following:
 ```bash
 $ cd memcached-sr 
 $ ./autogen.sh
-$ CC=clang-9 CFLAGS='-DREUSEPORT_OPT=1 -Wno-deprecated-declarations' ./configure && make
+$ CC=clang-18 CFLAGS='-DREUSEPORT_OPT=1 -Wno-deprecated-declarations' ./configure && make
 ```
 
 The ```memcached``` binary will be located in the memcached-sr directory.
