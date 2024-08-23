@@ -16,7 +16,8 @@
 struct window_data {
     uint64_t age;
     uint64_t dirty;
-    uint64_t evicted;
+    float evicted_ratio;
+    uint64_t evicted_seen; // if evictions were seen at all this window
 };
 
 typedef struct {
@@ -63,7 +64,8 @@ static void window_sum(struct window_data *wd, struct window_data *w, uint32_t s
         struct window_data *d = &wd[x];
         w->age += d->age;
         w->dirty += d->dirty;
-        w->evicted += d->evicted;
+        w->evicted_ratio += d->evicted_ratio;
+        w->evicted_seen += d->evicted_seen;
     }
 }
 
@@ -84,6 +86,11 @@ void slab_automove_run(void *arg, int *src, int *dst) {
     // fill after structs
     fill_item_stats_automove(a->iam_after);
     fill_slab_stats_automove(a->sam_after);
+    // Loop once to get total_evicted for this window.
+    uint64_t evicted_total = 0;
+    for (n = POWER_SMALLEST; n < MAX_NUMBER_OF_SLAB_CLASSES; n++) {
+        evicted_total += a->iam_after[n].evicted - a->iam_before[n].evicted;
+    }
     a->window_cur++;
 
     // iterate slabs
@@ -91,15 +98,18 @@ void slab_automove_run(void *arg, int *src, int *dst) {
         int w_offset = n * a->window_size;
         struct window_data *wd = &a->window_data[w_offset + (a->window_cur % a->window_size)];
         memset(wd, 0, sizeof(struct window_data));
-        // summarize the window-up-to-now.
-        memset(&w_sum, 0, sizeof(struct window_data));
-        window_sum(&a->window_data[w_offset], &w_sum, a->window_size);
 
         // if page delta, or evicted delta, mark window dirty
         // (or outofmemory)
-        if (a->iam_after[n].evicted - a->iam_before[n].evicted > 0 ||
-            a->iam_after[n].outofmemory - a->iam_before[n].outofmemory > 0) {
-            wd->evicted = 1;
+        uint64_t evicted_delta = a->iam_after[n].evicted - a->iam_before[n].evicted;
+        if (evicted_delta > 0) {
+            // FIXME: the python script is using floats. we have ints.
+            wd->evicted_ratio = (float) evicted_delta / evicted_total;
+            wd->evicted_seen = 1;
+            wd->dirty = 1;
+        }
+
+        if (a->iam_after[n].outofmemory - a->iam_before[n].outofmemory > 0) {
             wd->dirty = 1;
         }
         if (a->sam_after[n].total_pages - a->sam_before[n].total_pages > 0) {
@@ -109,6 +119,10 @@ void slab_automove_run(void *arg, int *src, int *dst) {
         // set age into window
         wd->age = a->iam_after[n].age;
 
+        // summarize the window-up-to-now.
+        memset(&w_sum, 0, sizeof(struct window_data));
+        window_sum(&a->window_data[w_offset], &w_sum, a->window_size);
+
         // grab age as average of window total
         uint64_t age = w_sum.age / a->window_size;
 
@@ -117,6 +131,7 @@ void slab_automove_run(void *arg, int *src, int *dst) {
             if (w_sum.dirty == 0) {
                 *src = n;
                 *dst = 0;
+                youngest = oldest = -1;
                 break;
             }
         }
@@ -129,10 +144,12 @@ void slab_automove_run(void *arg, int *src, int *dst) {
 
         // grab evicted count from window
         // if > half the window and youngest, mark as youngest
-        if (age < youngest_age && w_sum.evicted > a->window_size / 2) {
+        // or, if more than 25% of total evictions in the window.
+        if (age < youngest_age && (w_sum.evicted_seen > a->window_size / 2
+                    || w_sum.evicted_ratio / a->window_size > 0.25)) {
             youngest = n;
             youngest_age = age;
-            youngest_evicting = wd->evicted ? true : false;
+            youngest_evicting = wd->evicted_seen ? true : false;
         }
     }
 

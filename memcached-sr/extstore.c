@@ -1,5 +1,6 @@
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 
+#include "config.h"
 // FIXME: config.h?
 #include <stdint.h>
 #include <stdbool.h>
@@ -77,15 +78,15 @@ typedef struct {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     obj_io *queue;
+    obj_io *queue_tail;
     store_engine *e;
     unsigned int depth; // queue depth
 } store_io_thread;
 
-typedef struct {
+// sub-struct for maintenance related tasks.
+struct store_maint {
     pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    store_engine *e;
-} store_maint_thread;
+};
 
 struct store_engine {
     pthread_mutex_t mutex; /* covers internal stacks and variables */
@@ -93,8 +94,7 @@ struct store_engine {
     _store_wbuf *wbuf_stack; /* wbuf freelist */
     obj_io *io_stack; /* IO's to use with submitting wbuf's */
     store_io_thread *io_threads;
-    store_maint_thread *maint_thread;
-    store_page *page_freelist;
+    store_io_thread *bg_thread; /* dedicated thread for write submit / compact ops */
     store_page **page_buckets; /* stack of pages currently allocated to each bucket */
     store_page **free_page_buckets; /* stack of use-case isolated free pages */
     size_t page_size;
@@ -108,13 +108,27 @@ struct store_engine {
     unsigned int io_depth; /* FIXME: Might cache into thr struct */
     pthread_mutex_t stats_mutex;
     struct extstore_stats stats;
+    struct store_maint maint;
 };
+
+// FIXME: code is duplicated from thread.c since extstore.c doesn't pull in
+// the memcached ecosystem. worth starting a cross-utility header with static
+// definitions/macros?
+// keeping a minimal func here for now.
+#define THR_NAME_MAXLEN 16
+static void thread_setname(pthread_t thread, const char *name) {
+assert(strlen(name) < THR_NAME_MAXLEN);
+#if defined(__linux__) && defined(HAVE_PTHREAD_SETNAME_NP)
+pthread_setname_np(thread, name);
+#endif
+}
+#undef THR_NAME_MAXLEN
 
 static _store_wbuf *wbuf_new(size_t size) {
     _store_wbuf *b = calloc(1, sizeof(_store_wbuf));
     if (b == NULL)
         return NULL;
-    b->buf = malloc(size);
+    b->buf = calloc(size, sizeof(char));
     if (b->buf == NULL) {
         free(b);
         return NULL;
@@ -149,9 +163,10 @@ static store_io_thread *_get_io_thread(store_engine *e) {
 static uint64_t _next_version(store_engine *e) {
     return e->version++;
 }
+// internal only method for freeing a page up
+static void _free_page(store_engine *e, store_page *p);
 
 static void *extstore_io_thread(void *arg);
-static void *extstore_maint_thread(void *arg);
 
 /* Copies stats internal to engine and computes any derived values */
 void extstore_get_stats(void *ptr, struct extstore_stats *st) {
@@ -179,14 +194,37 @@ void extstore_get_stats(void *ptr, struct extstore_stats *st) {
 
 void extstore_get_page_data(void *ptr, struct extstore_stats *st) {
     store_engine *e = (store_engine *)ptr;
-    STAT_L(e);
-    memcpy(st->page_data, e->stats.page_data,
-            sizeof(struct extstore_page_data) * e->page_count);
-    STAT_UL(e);
+    pthread_mutex_lock(&e->maint.mutex);
+    struct extstore_page_data *pd = st->page_data;
+
+    for (int i = 0; i < e->page_count; i++) {
+        store_page *p = &e->pages[i];
+        pthread_mutex_lock(&p->mutex);
+
+        pd[p->id].free_bucket = p->free_bucket;
+        pd[p->id].version = p->version;
+        pd[p->id].bytes_used = p->bytes_used;
+        if (p->active) {
+            pd[p->id].active = true;
+        }
+        if (p->active || p->free) {
+            pthread_mutex_unlock(&p->mutex);
+            continue;
+        }
+        if (p->obj_count > 0 && !p->closed) {
+            pd[p->id].bucket = p->bucket;
+        }
+        if ((p->obj_count == 0 || p->closed) && p->refcount == 0) {
+            _free_page(e, p);
+        }
+        pthread_mutex_unlock(&p->mutex);
+    }
+
+    pthread_mutex_unlock(&e->maint.mutex);
 }
 
 const char *extstore_err(enum extstore_res res) {
-    char *rv = "unknown error";
+    const char *rv = "unknown error";
     switch (res) {
         case EXTSTORE_INIT_BAD_WBUF_SIZE:
             rv = "page_size must be divisible by wbuf_size";
@@ -252,15 +290,32 @@ void *extstore_init(struct extstore_conf_file *fh, struct extstore_conf *cf,
     e->page_size = cf->page_size;
     uint64_t temp_page_count = 0;
     for (f = fh; f != NULL; f = f->next) {
-        f->fd = open(f->file, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        f->fd = open(f->file, O_RDWR | O_CREAT, 0644);
         if (f->fd < 0) {
             *res = EXTSTORE_INIT_OPEN_FAIL;
 #ifdef EXTSTORE_DEBUG
-            perror("open");
+            perror("extstore open");
 #endif
             free(e);
             return NULL;
         }
+        // use an fcntl lock to help avoid double starting.
+        struct flock lock;
+        lock.l_type = F_WRLCK;
+        lock.l_start = 0;
+        lock.l_whence = SEEK_SET;
+        lock.l_len = 0;
+        if (fcntl(f->fd, F_SETLK, &lock) < 0) {
+            *res = EXTSTORE_INIT_OPEN_FAIL;
+            free(e);
+            return NULL;
+        }
+        if (ftruncate(f->fd, 0) < 0) {
+            *res = EXTSTORE_INIT_OPEN_FAIL;
+            free(e);
+            return NULL;
+        }
+
         temp_page_count += f->page_count;
         f->offset = 0;
     }
@@ -307,18 +362,13 @@ void *extstore_init(struct extstore_conf_file *fh, struct extstore_conf *cf,
 
     // free page buckets allows the app to organize devices by use case
     e->free_page_buckets = calloc(cf->page_buckets, sizeof(store_page *));
-    e->page_bucketcount = cf->page_buckets;
+    e->free_page_bucketcount = cf->page_buckets;
 
-    for (i = e->page_count-1; i > 0; i--) {
-        e->page_free++;
-        if (e->pages[i].free_bucket == 0) {
-            e->pages[i].next = e->page_freelist;
-            e->page_freelist = &e->pages[i];
-        } else {
-            int fb = e->pages[i].free_bucket;
-            e->pages[i].next = e->free_page_buckets[fb];
-            e->free_page_buckets[fb] = &e->pages[i];
-        }
+    e->page_free = e->page_count;
+    for (i = e->page_count-1; i >= 0; i--) {
+        int fb = e->pages[i].free_bucket;
+        e->pages[i].next = e->free_page_buckets[fb];
+        e->free_page_buckets[fb] = &e->pages[i];
     }
 
     // 0 is magic "page is freed" version
@@ -348,6 +398,7 @@ void *extstore_init(struct extstore_conf_file *fh, struct extstore_conf *cf,
 
     pthread_mutex_init(&e->mutex, NULL);
     pthread_mutex_init(&e->stats_mutex, NULL);
+    pthread_mutex_init(&e->maint.mutex, NULL);
 
     e->io_depth = cf->io_depth;
 
@@ -359,46 +410,75 @@ void *extstore_init(struct extstore_conf_file *fh, struct extstore_conf *cf,
         e->io_threads[i].e = e;
         // FIXME: error handling
         pthread_create(&thread, NULL, extstore_io_thread, &e->io_threads[i]);
+        thread_setname(thread, "mc-ext-io");
     }
     e->io_threadcount = cf->io_threadcount;
 
-    e->maint_thread = calloc(1, sizeof(store_maint_thread));
-    e->maint_thread->e = e;
-    // FIXME: error handling
-    pthread_mutex_init(&e->maint_thread->mutex, NULL);
-    pthread_cond_init(&e->maint_thread->cond, NULL);
-    pthread_create(&thread, NULL, extstore_maint_thread, e->maint_thread);
-
-    extstore_run_maint(e);
+    // dedicated IO thread for certain non-hotpath functions.
+    e->bg_thread = calloc(1, sizeof(store_io_thread));
+    e->bg_thread->e = e;
+    pthread_mutex_init(&e->bg_thread->mutex, NULL);
+    pthread_cond_init(&e->bg_thread->cond, NULL);
+    pthread_create(&thread, NULL, extstore_io_thread, e->bg_thread);
+    thread_setname(thread, "mc-ext-bgio");
 
     return (void *)e;
 }
 
-void extstore_run_maint(void *ptr) {
-    store_engine *e = (store_engine *)ptr;
-    pthread_cond_signal(&e->maint_thread->cond);
+// Call without *e locked, not a fast function.
+static void _evict_page(store_engine *e, unsigned int bucket,
+        unsigned int free_bucket) {
+    struct extstore_stats st;
+    st.page_data = calloc(e->page_count, sizeof(struct extstore_page_data));
+    extstore_get_page_data(e, &st);
+    uint64_t low_version = ULLONG_MAX;
+    unsigned int low_page = 0;
+
+    // find lowest version of anything in free_bucket OR 0
+    // unless free_bucket is 0
+    for (int i = 0; i < e->page_count; i++) {
+        // must belong to 0 or the requested free_bucket
+        if (st.page_data[i].free_bucket &&
+            st.page_data[i].free_bucket != free_bucket) {
+            continue;
+        }
+
+        // found a free page, don't evict.
+        if (st.page_data[i].version == 0) {
+            low_version = ULLONG_MAX;
+            break;
+        }
+
+        // find the lowest version.
+        if (!st.page_data[i].active &&
+                st.page_data[i].version < low_version) {
+            low_page = i;
+            low_version = st.page_data[i].version;
+        }
+    }
+
+    if (low_version != ULLONG_MAX) {
+        extstore_evict_page(e, low_page, low_version);
+    }
 }
 
 // call with *e locked
 static store_page *_allocate_page(store_engine *e, unsigned int bucket,
         unsigned int free_bucket) {
+    E_DEBUG("EXTSTORE: allocating new page [bucket:%u]\n", bucket);
     assert(!e->page_buckets[bucket] || e->page_buckets[bucket]->allocated == e->page_size);
     store_page *tmp = NULL;
-    // if a specific free bucket was requested, check there first
-    if (free_bucket != 0 && e->free_page_buckets[free_bucket] != NULL) {
+    if (e->free_page_buckets[free_bucket] != NULL) {
         assert(e->page_free > 0);
         tmp = e->free_page_buckets[free_bucket];
         e->free_page_buckets[free_bucket] = tmp->next;
+    } else if (e->free_page_buckets[0] != NULL) {
+        // fall back to default bucket.
+        assert(e->page_free > 0);
+        tmp = e->free_page_buckets[0];
+        e->free_page_buckets[0] = tmp->next;
     }
-    // failing that, try the global list.
-    if (tmp == NULL && e->page_freelist != NULL) {
-        tmp = e->page_freelist;
-        e->page_freelist = tmp->next;
-    }
-    E_DEBUG("EXTSTORE: allocating new page\n");
-    // page_freelist can be empty if the only free pages are specialized and
-    // we didn't just request one.
-    if (e->page_free > 0 && tmp != NULL) {
+    if (tmp != NULL) {
         tmp->next = e->page_buckets[bucket];
         e->page_buckets[bucket] = tmp;
         tmp->active = true;
@@ -408,11 +488,10 @@ static store_page *_allocate_page(store_engine *e, unsigned int bucket,
         tmp->bucket = bucket;
         e->page_free--;
         STAT_INCR(e, page_allocs, 1);
-    } else {
-        extstore_run_maint(e);
     }
+
     if (tmp)
-        E_DEBUG("EXTSTORE: got page %u\n", tmp->id);
+        E_DEBUG("EXTSTORE: got page %u [free:%u]\n", tmp->id, e->page_free);
     return tmp;
 }
 
@@ -496,7 +575,7 @@ static void _submit_wbuf(store_engine *e, store_page *p) {
     io->buf = w->buf;
     io->cb = _wbuf_cb;
 
-    extstore_submit(e, io);
+    extstore_submit_bg(e, io);
 }
 
 /* engine write function; takes engine, item_io.
@@ -522,8 +601,10 @@ int extstore_write_request(void *ptr, unsigned int bucket,
         p = _allocate_page(e, bucket, free_bucket);
     }
     pthread_mutex_unlock(&e->mutex);
-    if (!p)
+    if (!p) {
+        _evict_page(e, bucket, free_bucket);
         return ret;
+    }
 
     pthread_mutex_lock(&p->mutex);
 
@@ -533,8 +614,11 @@ int extstore_write_request(void *ptr, unsigned int bucket,
             ((!p->wbuf || p->wbuf->full) && p->allocated >= e->page_size)) {
         pthread_mutex_unlock(&p->mutex);
         pthread_mutex_lock(&e->mutex);
-        _allocate_page(e, bucket, free_bucket);
+        store_page *temp_p = _allocate_page(e, bucket, free_bucket);
         pthread_mutex_unlock(&e->mutex);
+        if (!temp_p) {
+            _evict_page(e, bucket, free_bucket);
+        }
         return ret;
     }
 
@@ -585,40 +669,52 @@ void extstore_write(void *ptr, obj_io *io) {
 }
 
 /* engine submit function; takes engine, item_io stack.
- * lock io_thread context and add stack?
+ * lock io_thread context and add stack
  * signal io thread to wake.
  * return success.
  */
-int extstore_submit(void *ptr, obj_io *io) {
-    store_engine *e = (store_engine *)ptr;
-    store_io_thread *t = _get_io_thread(e);
-
-    pthread_mutex_lock(&t->mutex);
-    if (t->queue == NULL) {
-        t->queue = io;
-    } else {
-        /* Have to put the *io stack at the end of current queue.
-         * FIXME: Optimize by tracking tail.
-         */
-        obj_io *tmp = t->queue;
-        while (tmp->next != NULL) {
-            tmp = tmp->next;
-            assert(tmp != t->queue);
-        }
-        tmp->next = io;
-    }
-    // TODO: extstore_submit(ptr, io, count)
+static int _extstore_submit(void *ptr, obj_io *io, store_io_thread *t) {
+    unsigned int depth = 0;
     obj_io *tio = io;
+    obj_io *tail = NULL;
     while (tio != NULL) {
-        t->depth++;
+        tail = tio; // keep updating potential tail.
+        depth++;
         tio = tio->next;
     }
+
+    pthread_mutex_lock(&t->mutex);
+
+    t->depth += depth;
+    if (t->queue == NULL) {
+        t->queue = io;
+        t->queue_tail = tail;
+    } else {
+        // Have to put the *io stack at the end of current queue.
+        assert(tail->next == NULL);
+        assert(t->queue_tail->next == NULL);
+        t->queue_tail->next = io;
+        t->queue_tail = tail;
+    }
+
     pthread_mutex_unlock(&t->mutex);
 
     //pthread_mutex_lock(&t->mutex);
     pthread_cond_signal(&t->cond);
     //pthread_mutex_unlock(&t->mutex);
     return 0;
+}
+
+int extstore_submit(void *ptr, obj_io *io) {
+    store_engine *e = (store_engine *)ptr;
+    store_io_thread *t = _get_io_thread(e);
+    return _extstore_submit(ptr, io, t);
+}
+
+int extstore_submit_bg(void *ptr, obj_io *io) {
+    store_engine *e = (store_engine *)ptr;
+    store_io_thread *t = e->bg_thread;
+    return _extstore_submit(ptr, io, t);
 }
 
 /* engine note delete function: takes engine, page id, size?
@@ -649,8 +745,8 @@ int extstore_delete(void *ptr, unsigned int page_id, uint64_t page_version,
         e->stats.objects_used -= count;
         STAT_UL(e);
 
-        if (p->obj_count == 0) {
-            extstore_run_maint(e);
+        if (p->obj_count == 0 && p->refcount == 0 && !p->active) {
+            _free_page(e, p);
         }
     } else {
         ret = -1;
@@ -671,15 +767,40 @@ int extstore_check(void *ptr, unsigned int page_id, uint64_t page_version) {
     return ret;
 }
 
-/* allows a compactor to say "we're done with this page, kill it. */
+/* allows a compactor to say "we're done with this page, kill it." */
 void extstore_close_page(void *ptr, unsigned int page_id, uint64_t page_version) {
     store_engine *e = (store_engine *)ptr;
     store_page *p = &e->pages[page_id];
 
     pthread_mutex_lock(&p->mutex);
-    if (!p->closed && p->version == page_version) {
+    if (!p->closed && !p->active && p->version == page_version) {
         p->closed = true;
-        extstore_run_maint(e);
+        if (p->refcount == 0) {
+            _free_page(e, p);
+        }
+    }
+    pthread_mutex_unlock(&p->mutex);
+}
+
+/* signal that we've forcefully ejected rather than gracefully closed */
+void extstore_evict_page(void *ptr, unsigned int page_id, uint64_t page_version) {
+    store_engine *e = (store_engine *)ptr;
+    store_page *p = &e->pages[page_id];
+
+    pthread_mutex_lock(&p->mutex);
+    if (!p->closed && !p->active && p->version == page_version) {
+        E_DEBUG("EXTSTORE: evicting page [%d] [v: %llu]\n",
+                p->id, (unsigned long long) p->version);
+
+        p->closed = true;
+        STAT_L(e);
+        e->stats.page_evictions++;
+        e->stats.objects_evicted += p->obj_count;
+        e->stats.bytes_evicted += p->bytes_used;
+        STAT_UL(e);
+        if (p->refcount == 0) {
+            _free_page(e, p);
+        }
     }
     pthread_mutex_unlock(&p->mutex);
 }
@@ -725,6 +846,9 @@ static void *extstore_io_thread(void *arg) {
         }
 
         // Pull and disconnect a batch from the queue
+        // Chew small batches from the queue so the IO thread picker can keep
+        // the IO queue depth even, instead of piling on threads one at a time
+        // as they gobble a queue.
         if (me->queue != NULL) {
             int i;
             obj_io *end = NULL;
@@ -734,6 +858,7 @@ static void *extstore_io_thread(void *arg) {
                 if (end->next) {
                     end = end->next;
                 } else {
+                    me->queue_tail = end->next;
                     break;
                 }
             }
@@ -773,8 +898,10 @@ static void *extstore_io_thread(void *arg) {
                     }
                     pthread_mutex_unlock(&p->mutex);
                     if (do_op) {
-#ifdef __APPLE__
-                        ret = lseek(p->fd, SEEK_SET, p->offset + cur_io->offset);
+#if !defined(HAVE_PREAD) || !defined(HAVE_PREADV)
+                        // TODO: lseek offset is natively 64-bit on OS X, but
+                        // perhaps not on all platforms? Else use lseek64()
+                        ret = lseek(p->fd, p->offset + cur_io->offset, SEEK_SET);
                         if (ret >= 0) {
                             if (cur_io->iov == NULL) {
                                 ret = read(p->fd, cur_io->buf, cur_io->len);
@@ -857,110 +984,9 @@ static void _free_page(store_engine *e, store_page *p) {
     p->closed = false;
     p->free = true;
     // add to page stack
-    // TODO: free_page_buckets first class and remove redundancy?
-    if (p->free_bucket != 0) {
-        p->next = e->free_page_buckets[p->free_bucket];
-        e->free_page_buckets[p->free_bucket] = p;
-    } else {
-        p->next = e->page_freelist;
-        e->page_freelist = p;
-    }
+    p->next = e->free_page_buckets[p->free_bucket];
+    e->free_page_buckets[p->free_bucket] = p;
     e->page_free++;
+    E_DEBUG("EXTSTORE: pages free %u\n", e->page_free);
     pthread_mutex_unlock(&e->mutex);
-}
-
-/* engine maint thread; takes engine context.
- * Uses version to ensure oldest possible objects are being evicted.
- * Needs interface to inform owner of pages with fewer objects or most space
- * free, which can then be actively compacted to avoid eviction.
- *
- * This gets called asynchronously after every page allocation. Could run less
- * often if more pages are free.
- *
- * Another allocation call is required if an attempted free didn't happen
- * due to the page having a refcount.
- */
-
-// TODO: Don't over-evict pages if waiting on refcounts to drop
-static void *extstore_maint_thread(void *arg) {
-    store_maint_thread *me = (store_maint_thread *)arg;
-    store_engine *e = me->e;
-    struct extstore_page_data *pd =
-        calloc(e->page_count, sizeof(struct extstore_page_data));
-    pthread_mutex_lock(&me->mutex);
-    while (1) {
-        int i;
-        bool do_evict = false;
-        unsigned int low_page = 0;
-        uint64_t low_version = ULLONG_MAX;
-
-        pthread_cond_wait(&me->cond, &me->mutex);
-        pthread_mutex_lock(&e->mutex);
-        // default freelist requires at least one page free.
-        // specialized freelists fall back to default once full.
-        if (e->page_free == 0 || e->page_freelist == NULL) {
-            do_evict = true;
-        }
-        pthread_mutex_unlock(&e->mutex);
-        memset(pd, 0, sizeof(struct extstore_page_data) * e->page_count);
-
-        for (i = 0; i < e->page_count; i++) {
-            store_page *p = &e->pages[i];
-            pthread_mutex_lock(&p->mutex);
-            pd[p->id].free_bucket = p->free_bucket;
-            if (p->active || p->free) {
-                pthread_mutex_unlock(&p->mutex);
-                continue;
-            }
-            if (p->obj_count > 0 && !p->closed) {
-                pd[p->id].version = p->version;
-                pd[p->id].bytes_used = p->bytes_used;
-                pd[p->id].bucket = p->bucket;
-                // low_version/low_page are only used in the eviction
-                // scenario. when we evict, it's only to fill the default page
-                // bucket again.
-                // TODO: experiment with allowing evicting up to a single page
-                // for any specific free bucket. this is *probably* required
-                // since it could cause a load bias on default-only devices?
-                if (p->free_bucket == 0 && p->version < low_version) {
-                    low_version = p->version;
-                    low_page = i;
-                }
-            }
-            if ((p->obj_count == 0 || p->closed) && p->refcount == 0) {
-                _free_page(e, p);
-                // Found a page to free, no longer need to evict.
-                do_evict = false;
-            }
-            pthread_mutex_unlock(&p->mutex);
-        }
-
-        if (do_evict && low_version != ULLONG_MAX) {
-            store_page *p = &e->pages[low_page];
-            E_DEBUG("EXTSTORE: evicting page [%d] [v: %llu]\n",
-                    p->id, (unsigned long long) p->version);
-            pthread_mutex_lock(&p->mutex);
-            if (!p->closed) {
-                p->closed = true;
-                STAT_L(e);
-                e->stats.page_evictions++;
-                e->stats.objects_evicted += p->obj_count;
-                e->stats.bytes_evicted += p->bytes_used;
-                STAT_UL(e);
-                if (p->refcount == 0) {
-                    _free_page(e, p);
-                }
-            }
-            pthread_mutex_unlock(&p->mutex);
-        }
-
-        // copy the page data into engine context so callers can use it from
-        // the stats lock.
-        STAT_L(e);
-        memcpy(e->stats.page_data, pd,
-                sizeof(struct extstore_page_data) * e->page_count);
-        STAT_UL(e);
-    }
-
-    return NULL;
 }

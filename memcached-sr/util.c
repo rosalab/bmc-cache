@@ -61,7 +61,7 @@ bool safe_strtoull(const char *str, uint64_t *out) {
             /* only check for negative signs in the uncommon case when
              * the unsigned number is so big that it's negative as a
              * signed number. */
-            if (strchr(str, '-') != NULL) {
+            if (memchr(str, '-', endptr - str) != NULL) {
                 return false;
             }
         }
@@ -91,7 +91,7 @@ bool safe_strtoull_hex(const char *str, uint64_t *out) {
             /* only check for negative signs in the uncommon case when
              * the unsigned number is so big that it's negative as a
              * signed number. */
-            if (strchr(str, '-') != NULL) {
+            if (memchr(str, '-', endptr - str) != NULL) {
                 return false;
             }
         }
@@ -136,7 +136,7 @@ bool safe_strtoul(const char *str, uint32_t *out) {
             /* only check for negative signs in the uncommon case when
              * the unsigned number is so big that it's negative as a
              * signed number. */
-            if (strchr(str, '-') != NULL) {
+            if (memchr(str, '-', endptr - str) != NULL) {
                 return false;
             }
         }
@@ -201,6 +201,23 @@ bool safe_strcpy(char *dst, const char *src, const size_t dstmax) {
    } else {
        return false;
    }
+}
+
+bool safe_memcmp(const void *a, const void *b, size_t len) {
+    const volatile unsigned char *ua = (const volatile unsigned char *)a;
+    const volatile unsigned char *ub = (const volatile unsigned char *)b;
+    int delta = 0;
+    size_t x;
+
+    for (x = 0; x < len; x++) {
+        delta |= ua[x] ^ ub[x];
+    }
+
+    if (delta == 0) {
+        return true;
+    } else {
+        return false;
+    }
 }
 
 void vperror(const char *fmt, ...) {

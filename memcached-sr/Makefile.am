@@ -1,10 +1,10 @@
 bin_PROGRAMS = memcached
-pkginclude_HEADERS = protocol_binary.h
+pkginclude_HEADERS = protocol_binary.h xxhash.h
 noinst_PROGRAMS = memcached-debug sizes testapp timedrun
 
 BUILT_SOURCES=
 
-testapp_SOURCES = testapp.c util.c util.h
+testapp_SOURCES = testapp.c util.c util.h stats_prefix.c stats_prefix.h jenkins_hash.c murmur3_hash.c hash.h cache.c crc32c.c
 
 timedrun_SOURCES = timedrun.c
 
@@ -12,25 +12,24 @@ memcached_SOURCES = memcached.c memcached.h \
                     hash.c hash.h \
                     jenkins_hash.c jenkins_hash.h \
                     murmur3_hash.c murmur3_hash.h \
+                    queue.h \
                     slabs.c slabs.h \
                     items.c items.h \
                     assoc.c assoc.h \
                     thread.c daemon.c \
-                    stats.c stats.h \
+                    stats_prefix.c stats_prefix.h \
                     util.c util.h \
-                    trace.h cache.h sasl_defs.h \
+                    trace.h cache.c cache.h sasl_defs.h \
                     bipbuffer.c bipbuffer.h \
+                    base64.c base64.h \
                     logger.c logger.h \
                     crawler.c crawler.h \
                     itoa_ljust.c itoa_ljust.h \
                     slab_automove.c slab_automove.h \
                     authfile.c authfile.h \
-                    restart.c restart.h
-
-if BUILD_CACHE
-memcached_SOURCES += cache.c
-testapp_SOURCES += cache.c
-endif
+                    restart.c restart.h \
+                    proto_text.c proto_text.h \
+                    proto_bin.c proto_bin.h
 
 if BUILD_SOLARIS_PRIVS
 memcached_SOURCES += solaris_priv.c
@@ -48,8 +47,26 @@ if BUILD_FREEBSD_PRIVS
 memcached_SOURCES += freebsd_priv.c
 endif
 
+if BUILD_DARWIN_PRIVS
+memcached_SOURCES += darwin_priv.c
+endif
+
 if ENABLE_SASL
 memcached_SOURCES += sasl_defs.c
+endif
+
+if ENABLE_PROXY
+memcached_SOURCES += proto_proxy.c proto_proxy.h vendor/mcmc/mcmc.h \
+					 proxy_xxhash.c proxy.h \
+					 proxy_await.c proxy_ustats.c \
+					 proxy_ratelim.c \
+					 proxy_jump_hash.c proxy_request.c \
+					 proxy_network.c proxy_lua.c \
+					 proxy_luafgen.c \
+					 proxy_config.c proxy_ring_hash.c \
+					 proxy_internal.c \
+					 proxy_tls.c proxy_tls.h \
+					 md5.c md5.h
 endif
 
 if ENABLE_EXTSTORE
@@ -69,6 +86,8 @@ memcached_debug_LDADD = @PROFILER_LDFLAGS@
 memcached_debug_CFLAGS = @PROFILER_FLAGS@
 
 memcached_LDADD =
+memcached_LDFLAGS =
+memcached_debug_LDFLAGS =
 memcached_DEPENDENCIES =
 memcached_debug_DEPENDENCIES =
 CLEANFILES=
@@ -91,13 +110,31 @@ memcached_debug_DEPENDENCIES += memcached_debug_dtrace.o
 CLEANFILES += memcached_dtrace.o memcached_debug_dtrace.o
 endif
 
+if ENABLE_PROXY
+memcached_LDADD += vendor/lua/src/liblua.a vendor/mcmc/mcmc.o
+memcached_debug_LDADD += vendor/lua/src/liblua.a vendor/mcmc/mcmc.o
+memcached_LDFLAGS += -rdynamic
+memcached_debug_LDFLAGS += -rdynamic
+endif
+
+if ENABLE_PROXY_URING
+memcached_LDADD += vendor/liburing/src/liburing.a
+memcached_debug_LDADD += vendor/liburing/src/liburing.a
+endif
+
 memcached_debug_CFLAGS += -DMEMCACHED_DEBUG
 
+# build fails on Darwin with const signature replacements.
+if DARWIN
 memcached_dtrace.h: memcached_dtrace.d
 	${DTRACE} -h -s memcached_dtrace.d
-	sed -e 's,void \*,const void \*,g' memcached_dtrace.h | \
-            sed -e 's,char \*,const char \*,g' | tr '\t' ' ' > mmc_dtrace.tmp
+else
+memcached_dtrace.h: memcached_dtrace.d
+	${DTRACE} -h -s memcached_dtrace.d
+	sed -e 's,void \*,const void \*,' memcached_dtrace.h | \
+	sed -e 's,char \*,const char \*,g' | tr '\t' ' ' > mmc_dtrace.tmp
 	mv mmc_dtrace.tmp memcached_dtrace.h
+endif
 
 memcached_dtrace.o: $(memcached_OBJECTS)
 	$(DTRACE) $(DTRACEFLAGS) -G -o memcached_dtrace.o -s ${srcdir}/memcached_dtrace.d $(memcached_OBJECTS)
@@ -109,6 +146,13 @@ memcached_debug_dtrace.o: $(memcached_debug_OBJECTS)
 SUBDIRS = doc
 DIST_DIRS = scripts
 EXTRA_DIST = doc scripts t memcached.spec memcached_dtrace.d version.m4 README.md LICENSE.bipbuffer
+EXTRA_DIST += vendor/Makefile vendor/lua/doc/* vendor/lua/Makefile vendor/lua/README
+EXTRA_DIST += vendor/lua/src/*.c vendor/lua/src/*.h vendor/lua/src/Makefile
+EXTRA_DIST += vendor/mcmc/LICENSE vendor/mcmc/Makefile vendor/mcmc/README.md vendor/mcmc/*.c vendor/mcmc/*.h
+
+if ENABLE_PROXY
+SUBDIRS += vendor
+endif
 
 MOSTLYCLEANFILES = *.gcov *.gcno *.gcda *.tcov
 
@@ -119,8 +163,8 @@ test_tls:
 test_basic_tls:
 	@if test $(SSL_TEST)1 != 1; then \
 	  echo "Running basic tests with TLS"; \
-	  $(srcdir)/testapp; \
-	  prove $(srcdir)/t/binary.t $(srcdir)/t/getset.t $(srcdir)/t/ssl*; \
+	  $(builddir)/testapp && \
+	  prove $(srcdir)/t/binary.t $(srcdir)/t/getset.t $(srcdir)/t/ssl* && \
 	  echo "Finished running basic TLS tests"; \
 	else \
 	  echo "Set SSL_TEST=1 to enable TLS tests"; \
@@ -128,8 +172,8 @@ test_basic_tls:
 endif
 
 test:	memcached-debug sizes testapp
-	$(srcdir)/sizes
-	$(srcdir)/testapp
+	$(builddir)/sizes
+	$(builddir)/testapp
 if ENABLE_TLS
 	@if test $(SSL_TEST)1 = 1; then \
           $(MAKE) SSL_TEST=1  test_basic_tls; \

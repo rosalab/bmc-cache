@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/bin/env perl
 
 use strict;
 use warnings;
@@ -122,7 +122,7 @@ $empty->('y');
 
 {
     diag "Some chunked item tests";
-    my $s2 = new_memcached('-o no_modern,slab_chunk_max=4096');
+    my $s2 = new_memcached('-o no_modern,slab_chunk_max=4');
     ok($s2, "started the server");
     my $m2 = MC::Client->new($s2);
     # Specifically trying to cross the chunk boundary when internally
@@ -443,7 +443,7 @@ $mc->silent_mutation(::CMD_ADDQ, 'silentadd', 'silentaddval');
     is(1024, $stats{'maxconns'});
     # we run SSL tests over TCP; hence the domain_socket
     # is expected to be NULL.
-    if (enabled_tls_testing()) {
+    if (enabled_tls_testing() || !supports_unix_socket()) {
         is('NULL', $stats{'domain_socket'});
     } else {
         isnt('NULL', $stats{'domain_socket'});

@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/bin/env perl
 # Networked logging tests.
 
 use strict;
@@ -9,7 +9,7 @@ use FindBin qw($Bin);
 use lib "$Bin/lib";
 use MemcachedTest;
 
-my $server = new_memcached('-m 48 -o slab_chunk_max=16384');
+my $server = new_memcached('-m 48 -o slab_chunk_max=16');
 my $sock = $server->sock;
 
 # We're testing to ensure item chaining doesn't corrupt or poorly overlap
@@ -32,7 +32,7 @@ for (1..5) {
     my $data = "x" x $size;
     print $sock "set foo$_ 0 0 $size\r\n$data\r\n";
     my $res = <$sock>;
-    is($res, "STORED\r\n", "stored some big items");
+    is($res, "STORED\r\n", "stored some big items: $size");
 }
 
 {

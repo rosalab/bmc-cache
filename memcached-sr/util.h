@@ -1,3 +1,5 @@
+#include "config.h"
+
 /* fast-enough functions for uriencoding strings. */
 void uriencode_init(void);
 bool uriencode(const char *src, char *dst, const size_t srclen, const size_t dstlen);
@@ -18,6 +20,7 @@ bool safe_strtoul(const char *str, uint32_t *out);
 bool safe_strtol(const char *str, int32_t *out);
 bool safe_strtod(const char *str, double *out);
 bool safe_strcpy(char *dst, const char *src, const size_t dstmax);
+bool safe_memcmp(const void *a, const void *b, size_t len);
 
 #ifndef HAVE_HTONLL
 extern uint64_t htonll(uint64_t);

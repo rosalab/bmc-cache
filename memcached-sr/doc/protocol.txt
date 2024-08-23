@@ -76,18 +76,19 @@ A command line always starts with the name of the command, followed by
 parameters (if any) delimited by whitespace. Command names are
 lower-case and are case-sensitive.
 
-Meta Commands [EXPERIMENTAL: MAY CHANGE]
+Meta Commands
 -------------
 
 Meta commands are a set of new ASCII-based commands. They follow the same
-structure of the basic commands but have a new flexible feature set.
+structure of the original commands but have a new flexible feature set.
 Meta commands incorporate most features available in the binary protocol, as
 well as a flag system to make the commands flexible rather than having a
 large number of high level commands. These commands completely replace the
 usage of basic Storage and Retrieval commands.
 
-Meta commands are EXPERIMENTAL and may change syntax as of this writing. They
-are documented below the basic commands.
+Meta flags are not to be confused with client bitflags, which is an opaque
+number passed by the client. Meta flags change how the command operates, but
+they are not stored in cache.
 
 These work mixed with normal protocol commands on the same connection. All
 existing commands continue to work. The meta commands will not replace
@@ -96,23 +97,38 @@ noted in the 'Commands' section above.
 
 All meta commands follow a basic syntax:
 
-cm <key> <flags> <token1> <token2> <...>\r\n
+<cm> <key> <datalen*> <flag1> <flag2> <...>\r\n
 
-Where 'cm' is a 2 character command code. The number of tokens supplied is
-based off of the flags used.
+Where <cm> is a 2 character command code.
+<datalen> is only for commands with payloads, like set.
 
 Responses look like:
 
-RC <flags> <token1> <token2> <...>\r\n
+<RC> <datalen*> <flag1> <flag2> <...>\r\n
 
-Where 'rc' is a 2 character return code. The number of tokens returned are
-based off of the flags used.
+Where <RC> is a 2 character return code. The number of flags returned are
+based off of the flags supplied.
+
+<datalen> is only for responses with payloads, with the return code 'VA'.
 
 Flags are single character codes, ie 'q' or 'k' or 'I', which adjust the
-behavior of the command. The flags are reflected in the response. The order of
-which tokens are consumed or returned depend on the order of the flags given.
-For example, a metaget with flags of 'st' would return tokens for "size" and
-"TTL remaining" in that order. 'ts' would return "TTL remaining" then "size".
+behavior of the command. If a flag requests a response flag (ie 't' for TTL
+remaining), it is returned in the same order as they were in the original
+command, though this is not strict.
+
+Flags are single character codes, ie 'q' or 'k' or 'O', which adjust the
+behavior of a command. Flags may contain token arguments, which come after the
+flag and before the next space or newline, ie 'Oopaque' or 'Kuserkey'. Flags
+can return new data or reflect information, in the same order they were
+supplied in the request. Sending an 't' flag with a get for an item with 20
+seconds of TTL remaining, would return 't20' in the response.
+
+All commands accept a tokens 'P' and 'L' which are completely ignored. The
+arguments to 'P' and 'L' can be used as hints or path specifications to a
+proxy or router inbetween a client and a memcached daemon. For example, a
+client may prepend a "path" in the key itself: "mg /path/foo v" or in a proxy
+token: "mg foo Lpath/ v" - the proxy may then optionally remove or forward the
+token to a memcached daemon, which will ignore them.
 
 Syntax errors are handled the same as noted under 'Error strings' section
 below.
@@ -450,13 +466,19 @@ Meta Debug
 The meta debug command is a human readable dump of all available internal
 metadata of an item, minus the value.
 
-me <key>\r\n
+me <key> <flag>\r\n
 
 - <key> means one key string.
+- if <flag> is 'b', then <key> is a base64 encoded binary value. the response
+  key will also be base64 encoded.
 
 The response looks like:
 
-ME <key> <k>=<v>*\r\nEN\r\n
+ME <key> <k>=<v>*\r\n
+
+A miss looks like:
+
+EN\r\n
 
 Each of the keys and values are the internal data for the item.
 
@@ -476,22 +498,15 @@ The meta get command is the generic command for retrieving key data from
 memcached. Based on the flags supplied, it can replace all of the commands:
 "get", "gets", "gat", "gats", "touch", as well as adding new options.
 
-mg <key> <flags> <tokens>*\r\n
+mg <key> <flags>*\r\n
 
 - <key> means one key string. Unlike "get" metaget can only take a single key.
 
 - <flags> are a set of single character codes ended with a space or newline.
-
-- <tokens>* means zero or more tokens, based on the flags supplied. They are
-  consumed in order specified by the flags.
+  flags may have token strings after the initial character.
 
 After this command, the client expects an item to be returned, received as a
-text line followed by an optional data block. After the item is transferred,
-the server sends the string
-
-"EN\r\n"
-
-to indicate the end of the response.
+text line followed by an optional data block.
 
 If a response line appearing in a retrieval request is not sent back
 by the server this means that the server does not
@@ -501,26 +516,37 @@ deleted by a client).
 
 An item sent by the server looks like:
 
-VA <flags> <tokens>*\r\n
+VA <size> <flags>*\r\n
 <data block>\r\n
 
-- <flags> are a reflection of the flags sent to the server. Extra flags can be
-  added to the response based on the execution of the command.
+- <size> is the size of <data block> in bytes, minus the \r\n
 
-- <tokens>* are tokens returned by the server, based on the flags supplied.
+- <flags>* are flags returned by the server, based on the command flags.
   They are added in order specified by the flags sent.
 
-- <data block> is the data for this item. Note that the data black is
+- <data block> is the data for this item. Note that the data block is
   optional, requiring the 'v' flag to be supplied.
+
+If the request did not ask for a value in the response (v) flag, the server
+response looks like:
+
+HD <flags>*\r\n
+
+If the request resulted in a miss, the response looks like:
+
+EN\r\n
+
+Unless the (q) flag was supplied, which suppresses the status code for a miss.
 
 The flags used by the 'mg' command are:
 
+- b: interpret key as base64 encoded binary value
 - c: return item cas token
 - f: return client flags token
 - h: return whether item has been hit before as a 0 or 1
 - k: return key as a token
 - l: return time since item was last accessed in seconds
-- O (token): opaque value, consumes a token and copies back with response
+- O(token): opaque value, consumes a token and copies back with response
 - q: use noreply semantics for return codes.
 - s: return item size token
 - t: return item TTL remaining in seconds (-1 for unlimited)
@@ -528,16 +554,26 @@ The flags used by the 'mg' command are:
 - v: return item value in <data block>
 
 These flags can modify the item:
-- N (token): vivify on miss, takes TTL as a argument
-- R (token): if token is less than remaining TTL win for recache
-- T (token): update remaining TTL
+- E(token): use token as new CAS value if item is modified
+- N(token): vivify on miss, takes TTL as a argument
+- R(token): if remaining TTL is less than token, win for recache
+- T(token): update remaining TTL
 
 These extra flags can be added to the response:
 - W: client has "won" the recache flag
 - X: item is stale
-- Z: tem has already sent a winning flag
+- Z: item has already sent a winning flag
 
 The flags are now repeated with detailed information where useful:
+
+- b: interpret key as base64 encoded binary value
+
+This flag instructs memcached to run a base64 decoder on <key> before looking
+it up. This allows storing and fetching of binary packed keys, so long as they
+are sent to memcached in base64 encoding.
+
+If 'b' flag is sent in the response, and a key is returned via 'k', this
+signals to the client that the key is base64 encoded binary.
 
 - h: return whether item has been hit before as a 0 or 1
 - l: return time since item was last accessed in seconds
@@ -546,9 +582,9 @@ The above two flags return the value of "hit before?" and "last access time"
 before the command was processed. Otherwise this would always show a 1 for
 hit or always show an access time of "0" unless combined with the "u" flag.
 
-- O (token): opaque value, consumes a token and copies back with response
+- O(token): opaque value, consumes a token and copies back with response
 
-The O (opaque) token is used by this and other commands to allow easier
+The O(opaque) token is used by this and other commands to allow easier
 pipelining of requests while saving bytes on the wire for responses. For
 example: if pipelining three get commands together, you may not know which
 response belongs to which without also retrieving the key. If the key is very
@@ -581,10 +617,17 @@ access time.
 - v: return item value in <data block>
 
 The data block for a metaget response is optional, requiring this flag to be
-passed in.
+passed in. The response code also changes from "HD" to "VA <size>"
 
 These flags can modify the item:
-- N (token): vivify on miss, takes TTL as a argument
+- E(token): use token as new CAS value if item is modified
+
+Normally when an item is created it is given a CAS value from an internal
+atomically incrementing counter. This allows overriding the CAS (8 byte
+unsigned integer) with the specified value. This is useful for using an
+external system to version cache data (row versions, clocks, etc).
+
+- N(token): vivify on miss, takes TTL as a argument
 
 Used to help with so called "dog piling" problems with recaching of popular
 items. If supplied, and metaget does not find the item in cache, it will
@@ -599,14 +642,14 @@ already received the win flag.
 
 Can be combined with CAS flags to gate the update further.
 
-- R (token): if token is less than remaining TTL win for recache
+- R(token): if token is less than remaining TTL win for recache
 
 Similar to and can be combined with 'N'. If the remaining TTL of an item is
 below the supplied token, return a 'W' flag to indicate the client has "won"
 the right to recache an item. This allows refreshing an item before it leads to
 a miss.
 
-- T (token): update remaining TTL
+- T(token): update remaining TTL
 
 Similar to "touch" and "gat" commands, updates the remaining TTL of an item if
 hit.
@@ -642,35 +685,35 @@ may decide to retry later or take some other action.
 Meta Set
 --------
 
-The meta set command a generic command for storing data to memcached. Based on
-the flags supplied, it can replace the commands: "set", "cas". as well as
-adding new options.
+The meta set command a generic command for storing data to memcached. Based
+on the flags supplied, it can replace all storage commands (see token M) as
+well as adds new options.
 
-ms <key> <flags> <tokens>*\r\n
+ms <key> <datalen> <flags>*\r\n
 
 - <key> means one key string.
 
-- <flags> are a set of single character codes ended with a space or newline.
+- <datalen> is the length of the payload data.
 
-- <tokens>* means zero or more tokens, based on the flags supplied. They are
-  consumed in order specified by the flags.
+- <flags> are a set of single character codes ended with a space or newline.
+  flags may have strings after the initial character.
 
 After this line, the client sends the data block:
 
 <data block>\r\n
 
 - <data block> is a chunk of arbitrary 8-bit data of length supplied by an 'S'
-  flag and token from the previous line. If no 'S' flag is supplied the data
+  flag and token from the request line. If no 'S' flag is supplied the data
   is assumed to be 0 length.
 
 After sending the command line and the data block the client awaits
 the reply, which is of the format:
 
-CD <flags> <tokens>*\r\n
+<CD> <flags>*\r\n
 
 Where CD is one of:
 
-- "ST" (STORED), to indicate success.
+- "HD" (STORED), to indicate success.
 
 - "NS" (NOT_STORED), to indicate the data was not stored, but not
 because of an error.
@@ -683,25 +726,34 @@ with CAS semantics did not exist.
 
 The flags used by the 'ms' command are:
 
-- C (token): compare CAS value when storing item
-- F (token): set client flags to token (32 bit unsigned numeric)
-- I: invalid. set-to-invalid if CAS is older than it should be.
+- b: interpret key as base64 encoded binary value (see metaget)
+- c: return CAS value if successfully stored.
+- C(token): compare CAS value when storing item
+- E(token): use token as new CAS value (see metaget for detail)
+- F(token): set client flags to token (32 bit unsigned numeric)
+- I: invalidate. set-to-invalid if supplied CAS is older than item's CAS
 - k: return key as a token
-- O (token): opaque value, consumes a token and copies back with response
+- O(token): opaque value, consumes a token and copies back with response
 - q: use noreply semantics for return codes
-- S (token): size of <data block> to store
-- T (token): Time-To-Live for item, see "Expiration" above.
+- s: return the size of the stored item on success (ie; new size on append)
+- T(token): Time-To-Live for item, see "Expiration" above.
+- M(token): mode switch to change behavior to add, replace, append, prepend
+- N(token): if in append mode, autovivify on miss with supplied TTL
 
 The flags are now repeated with detailed information where useful:
 
-- C (token): compare CAS value when storing item
+- c: returns the CAS value on successful storage. Will return 0 on error, but
+  clients must not depend on the return value being zero. In future versions
+this may return the current CAS value for "EX" return code conditions.
+
+- C(token): compare CAS value when storing item
 
 Similar to the basic "cas" command, only store item if the supplied token
 matches the current CAS value of the item. When combined with the 'I' flag, a
 CAS value that is _lower_ than the current value may be accepted, but the item
 will be marked as "stale", returning the X flag with mget requests.
 
-- F (token): set client flags to token (32 bit unsigned numeric)
+- F(token): set client flags to token (32 bit unsigned numeric)
 
 Sets flags to 0 if not supplied.
 
@@ -709,18 +761,38 @@ Sets flags to 0 if not supplied.
 
 Functional when combined with 'C' flag above.
 
-- O (token): opaque value, consumes a token and copies back with response
+- O(token): opaque value, consumes a token and copies back with response
 
 See description under 'Meta Get'
 
 - q: use noreply semantics for return codes
 
 Noreply is a method of reducing the amount of data sent back by memcached to
-the client for normal responses. In the case of metaset, a response that would
-start with "ST" (STORED) will not be sent. Any other code, such as "EX"
+the client for normal responses. In the case of metaset, a response that
+would start with "HD" will not be sent. Any other code, such as "EX"
 (EXISTS) will still be returned.
 
 Errors are always returned.
+
+- M(token): mode switch. Takes a single character for the mode.
+
+E: "add" command. LRU bump and return NS if item exists. Else
+add.
+A: "append" command. If item exists, append the new value to its data.
+P: "prepend" command. If item exists, prepend the new value to its data.
+R: "replace" command. Set only if item already exists.
+S: "set" command. The default mode, added for completeness.
+
+The "cas" command is supplanted by specifying the cas value with the 'C' flag.
+Append and Prepend modes will also respect a supplied cas value.
+
+- N(token): if in append mode, autovivify on miss with supplied TTL
+
+Append and Prepend modes normally ignore the T argument, as they cannot create
+a new item on a miss. If N is supplied, and append reaches a miss, it will
+create a new item seeded with the data from the append command. It uses the
+TTL from N instead of T to be consistent with the usage of N in other
+commands.
 
 Meta Delete
 -----------
@@ -728,22 +800,20 @@ Meta Delete
 The meta delete command allows for explicit deletion of items, as well as
 marking items as "stale" to allow serving items as stale during revalidation.
 
-md <key> <flags> <tokens>*\r\n
+md <key> <flags>*\r\n
 
 - <key> means one key string.
 
 - <flags> are a set of single character codes ended with a space or newline.
-
-- <tokens>* means zero or more tokens, based on the flags supplied. They are
-  consumed in order specified by the flags.
+  flags may have strings after the initial character.
 
 The response is in the format:
 
-CD <flags> <tokens>*\r\n
+<CD> <flags> <tokens>*\r\n
 
 Where CD is one of:
 
-- "DE" (DELETED), to indicate success
+- "HD" (DELETED), to indicate success
 
 - "NF" (NOT_FOUND), to indicate that the item with this key was not found.
 
@@ -752,16 +822,19 @@ Where CD is one of:
 
 The flags used by the 'md' command are:
 
-- C (token): compare CAS value
+- b: interpret key as base64 encoded binary value (see metaget)
+- C(token): compare CAS value
+- E(token): use token as new CAS value (see metaget for detail)
 - I: invalidate. mark as stale, bumps CAS.
 - k: return key
-- O: opaque to copy back.
+- O(token): opaque to copy back.
 - q: noreply
-- T (token): updates TTL, only when paired with the 'I' flag
+- T(token): updates TTL, only when paired with the 'I' flag
+- x: removes the item value, but leaves the item.
 
 The flags are now repeated with detailed information where useful:
 
-- C (token): compare CAS value
+- C(token): compare CAS value
 
 Can be used to only delete or mark-stale if a supplied CAS value matches.
 
@@ -771,7 +844,7 @@ Instead of removing an item, this will give the item a new CAS value and mark
 it as stale. This means when it is later fetched by metaget, the client will
 be supplied an 'X' flag to show the data is stale and needs to be recached.
 
-- O (token): opaque to copy back.
+- O(token): opaque to copy back.
 
 See description under 'Meta Get'
 
@@ -780,11 +853,104 @@ See description under 'Meta Get'
 See description under 'Meta Set'. In the case of meta delete, this will hide
 response lines with the code "DE". It will still return any other responses.
 
-- T (token): updates TTL, only when paired with the 'I' flag
+- T(token): updates TTL, only when paired with the 'I' flag
 
 When marking an item as stale with 'I', the 'T' flag can be used to update the
 TTL as well; limiting the amount of time an item will live while stale and
 waiting to be recached.
+
+- x: removes the item value, but leaves the item.
+
+This deletes the value off of an item (by replacing it with an empty value
+item atomically). Combined with I this can leave what is effectively a
+tombstone of a previous value.
+
+Meta Arithmetic
+---------------
+
+The meta arithmetic command allows for basic operations against numerical
+values. This replaces the "incr" and "decr" commands. Values are unsigned
+64bit integers. Decrementing will reach 0 rather than underflow. Incrementing
+can overflow.
+
+ma <key> <flags>*\r\n
+
+- <key> means one key string.
+
+- <flags> are a set of single character codes ended with a space or newline.
+  flags may have strings after the initial character.
+
+The response is in the format:
+
+<CD> <flags> <tokens>*\r\n
+
+Where CD is one of:
+
+- "HD" to indicate success
+
+- "NF" (NOT_FOUND), to indicate that the item with this key was not found.
+
+- "NS" (NOT_STORED), to indicate that the item was not created as requested
+  after a miss.
+
+- "EX" (EXISTS), to indicate that the supplied CAS token does not match the
+  stored item.
+
+If the 'v' flag is supplied, the response is formatted as:
+
+VA <size> <flags>*\r\n
+<number>\r\n
+
+The flags used by the 'ma' command are:
+
+- b: interpret key as base64 encoded binary value (see metaget)
+- C(token): compare CAS value (see mset)
+- E(token): use token as new CAS value (see metaget for detail)
+- N(token): auto create item on miss with supplied TTL
+- J(token): initial value to use if auto created after miss (default 0)
+- D(token): delta to apply (decimal unsigned 64-bit number, default 1)
+- T(token): update TTL on success
+- M(token): mode switch to change between incr and decr modes.
+- O(token): opaque value, consumes a token and copies back with response
+- q: use noreply semantics for return codes (see details under mset)
+- t: return current TTL
+- c: return current CAS value if successful.
+- v: return new value
+- k: return key as a token
+
+The flags are now repeated with detailed information where useful:
+
+- C(token): compare CAS value
+
+Can be used to only incr/decr if a supplied CAS value matches. A new CAS value
+is generated after a delta is applied. Add the 'c' flag to get the new CAS
+value after success.
+
+- N(token): auto create item on miss with supplied TTL
+
+Similar to mget, on a miss automatically create the item. A value can be
+seeded using the J flag.
+
+- J(token): initial value
+
+An unsigned 64-bit integer which will be seeded as the value on a miss. Must be
+combined with an N flag.
+
+- D(token): delta to apply
+
+An unsigned integer to either add or subtract from the currently stored
+number.
+
+- T(token): update TTL
+
+On success, sets the remaining TTL to the supplied value.
+
+-M(token): mode switch. Takes a single character for the mode.
+
+I: Increment mode (default)
++: Alias for increment
+D: Decrement mode
+-: Alias for decrement
 
 Meta No-Op
 ----------
@@ -792,18 +958,18 @@ Meta No-Op
 The meta no-op command exists solely to return a static response code. It
 takes no flags, no arguments.
 
+"mn\r\n"
+
 This returns the static response:
 
-"EN\r\n"
-
-Similar to a meta get command.
+"MN\r\n"
 
 This command is useful when used with the 'q' flag and pipelining commands.
-For example, with 'mg' the response lines are blank on miss, and the 'q' flag
-will hide the "EN\r\n" response code. If pipelining several 'mg's together
-with noreply semantics, an "mn\r\n" command can be tagged to the end of the
-chain, which will return an "EN\r\n", signalling to a client that all previous
-commands have been processed.
+For example, with 'mg' the response lines are blank on miss when the 'q' flag
+is supplied. If pipelining several 'mg's together with noreply semantics, an
+"mn\r\n" command can be tagged to the end of the chain, which will return an
+"MN\r\n", signalling to a client that all previous commands have been
+processed.
 
 Slabs Reassign
 --------------
@@ -966,12 +1132,17 @@ The response line could be one of:
 
 - "BADCLASS [message]" to indicate an invalid class was specified.
 
-lru_crawler metadump <classid,classid,classid|all>
+lru_crawler metadump <classid,classid,classid|all|hash>
 
 - Similar in function to the above "lru_crawler crawl" command, this function
   outputs one line for every valid item found in the matching slab classes.
   Similar to "cachedump", but does not lock the cache and can return all
   items, not just 1MB worth.
+
+  if "hash" is specified instead of a classid or "all", the crawler will dump
+  items by directly walking the hash table instead of the LRU's. This makes it
+  more likely all items will be visited once as LRU reordering and locking can
+  cause frequently accessed items to be missed.
 
   Lines are in "key=value key2=value2" format, with value being URI encoded
   (ie: %20 for a space).
@@ -989,6 +1160,31 @@ The response line could be one of:
 
 - "BADCLASS [message]" to indicate an invalid class was specified.
 
+lru_crawler mgdump <classid,classid,classid|all|hash>
+
+- Similar in function to the above "lru_crawler crawl" command, this function
+  outputs one line for every valid item found in the matching slab classes.
+
+  If "hash" is specified instead of a classid or "all", the crawler will dump
+  items by directly walking the hash table instead of the LRU's. This makes it
+  more likely all items will be visited once as LRU reordering and locking can
+  cause frequently accessed items to be missed.
+
+  Lines are in a basic metaget format, like: "mg key\r\n". If a key is in
+  binary format: "mg base64encodedkey b\r\n"
+  A user may then take each line, append any flags they want, and run those
+  commands against the server to fetch exactly what they want to know.
+
+The response line could be one of:
+
+- "OK" to indicate successful launch.
+
+- "BUSY [message]" to indicate the crawler is already processing a request.
+
+- "BADCLASS [message]" to indicate an invalid class was specified.
+
+
+
 Watchers
 --------
 
@@ -996,7 +1192,7 @@ Watchers are a way to connect to memcached and inspect what's going on
 internally. This is an evolving feature so new endpoints should show up over
 time.
 
-watch <fetchers|mutations|evictions>
+watch <fetchers|mutations|evictions|connevents|deletions>
 
 - Turn connection into a watcher. Options can be stacked and are
   space-separated. Logs will be sent to the watcher until it disconnects.
@@ -1030,6 +1226,23 @@ The arguments are:
 - "evictions": Shows some information about items as they are evicted from the
   cache. Useful in seeing if items being evicted were actually used, and which
   keys are getting removed.
+
+- "connevents": Emits logs when connections are opened and closed, i.e. when
+  clients connect or disconnect. For TCP transports, logs indicate the remote
+  address IP and port. Connection close events additionally supply a reason for
+  closing the connection.
+
+- "proxyreqs": Emits detailed timing logs about requests/responses being
+  returned to a client while in proxy mode. The conditions which logs are
+  written here may be influenced by configuration.
+
+- "proxyevents": Emits internal proxy errors and system events, such as
+  configuration reloads.
+
+- "proxyuser": Emits log entries created from lua configuration files.
+
+- "deletions": Emits logs when an item is successfully deleted from the
+  cache using `delete` or `md` commands. delete misses wouldn't be logged
 
 Statistics
 ----------
@@ -1097,7 +1310,21 @@ integers separated by a colon (treat this as a floating point number).
 | rejected_connections  | 64u     | Conns rejected in maxconns_fast mode      |
 | connection_structures | 32u     | Number of connection structures allocated |
 |                       |         | by the server                             |
+| response_obj_oom      | 64u     | Connections closed by lack of memory      |
+| response_obj_count    | 64u     | Total response objects in use             |
+| response_obj_bytes    | 64u     | Total bytes used for resp. objects. is a  |
+|                       |         | subset of bytes from read_buf_bytes.      |
+| read_buf_count        | 64u     | Total read/resp buffers allocated         |
+| read_buf_bytes        | 64u     | Total read/resp buffer bytes allocated    |
+| read_buf_bytes_free   | 64u     | Total read/resp buffer bytes cached       |
+| read_buf_oom          | 64u     | Connections closed by lack of memory      |
 | reserved_fds          | 32u     | Number of misc fds used internally        |
+| proxy_conn_requests   | 64u     | Number of requests received by the proxy  |
+| proxy_conn_errors     | 64u     | Number of internal errors from proxy      |
+| proxy_conn_oom        | 64u     | Number of out of memory errors while      |
+|                       |         | serving proxy requests                    |
+| proxy_req_active      | 64u     | Number of in-flight proxy requests        |
+| proxy_req_await       | 64u     | Number of in-flight proxy async requests  |
 | cmd_get               | 64u     | Cumulative number of retrieval reqs       |
 | cmd_set               | 64u     | Cumulative number of storage reqs         |
 | cmd_flush             | 64u     | Cumulative number of flush reqs           |
@@ -1125,6 +1352,12 @@ integers separated by a colon (treat this as a floating point number).
 |                       |         | with a new expiration time                |
 | touch_misses          | 64u     | Number of items that have been touched    |
 |                       |         | and not found                             |
+| store_too_large       | 64u     | Number of rejected storage requests       |
+|                       |         | caused by attempting to write a value     |
+|                       |         | larger than the -I limit                  |
+| store_no_memory       | 64u     | Number of rejected storage requests       |
+|                       |         | caused by exhaustion of the -m memory     |
+|                       |         | limit (relevant when -M is used)          |
 | auth_cmds             | 64u     | Number of authentication commands         |
 |                       |         | handled, success or failure.              |
 | auth_errors           | 64u     | Number of failed authentications.         |
@@ -1197,6 +1430,12 @@ integers separated by a colon (treat this as a floating point number).
 | log_worker_written    | 64u     | Logs written by a worker, to be picked up |
 | log_watcher_skipped   | 64u     | Logs not sent to slow watchers.           |
 | log_watcher_sent      | 64u     | Logs written to watchers.                 |
+| log_watchers          | 64u     | Number of currently active watchers.      |
+| unexpected_napi_ids   | 64u     | Number of times an unexpected napi id is  |
+|                       |         | is received. See doc/napi_ids.txt         |
+| round_robin_fallback  | 64u     | Number of times napi id of 0 is received  |
+|                       |         | resulting in fallback to round robin      |
+|                       |         | thread selection. See doc/napi_ids.txt    |
 |-----------------------+---------+-------------------------------------------|
 
 Settings statistics
@@ -1225,6 +1464,7 @@ other stats command.
 | evictions         | on/off   | When off, LRU evictions are disabled.        |
 | domain_socket     | string   | Path to the domain socket (if any).          |
 | umask             | 32 (oct) | umask for the creation of the domain socket. |
+| shutdown_command  | yes/no   | If shutdown admin command is enabled.        |
 | growth_factor     | float    | Chunk size growth factor.                    |
 | chunk_size        | 32       | Minimum space allocated for key+value+flags. |
 | num_threads       | 32       | Number of threads (including dispatch).      |
@@ -1264,12 +1504,19 @@ other stats command.
 |                   |          | per active watcher connected.                |
 | worker_logbuf_size| 32u      | Size of internal per-worker-thread buffer    |
 |                   |          | which the background thread reads from.      |
+| read_obj_mem_limit| 32u      | Megabyte limit for conn. read/resp buffers.  |
 | track_sizes       | bool     | If yes, a "stats sizes" histogram is being   |
 |                   |          | dynamically tracked.                         |
 | inline_ascii_response                                                       |
 |                   | bool     | Does nothing as of 1.5.15                    |
 | drop_privileges   | bool     | If yes, and available, drop unused syscalls  |
 |                   |          | (see seccomp on Linux, pledge on OpenBSD)    |
+| proxy_enabled     | bool     | If proxy has been configured at start        |
+| proxy_uring_enabled                                                         |
+                    | bool     | If proxy is configured to use IO_URING.      |
+                    |          | NOTE: uring may be used if kernel too old    |
+| memory_file       | char     | Warm restart memory file path, if enabled    |
+| client_flags_size | 32u      | Size in bytes of client flags                |
 |-------------------+----------+----------------------------------------------|
 
 
@@ -1371,7 +1618,8 @@ The server terminates this list with the line
 END\r\n
 
 'size' is an approximate size of the item, within 32 bytes.
-'count' is the amount of items that exist within that 32-byte range.
+'count' is the approximate amount of items that exist within that 32-byte
+range.
 
 This is essentially a display of all of your items if there was a slab class
 for every 32 bytes. You can use this to determine if adjusting the slab growth
@@ -1381,24 +1629,9 @@ most of your items are less than 200 bytes in size.
 
 In 1.4.27 and after, this feature must be manually enabled.
 
-A "stats" command with the argument of "sizes_enable" will enable the
-histogram at runtime. This has a small overhead to every store or delete
-operation. If you don't want to incur this, leave it off.
-
-A "stats" command with the argument of "sizes_disable" will disable the
-histogram.
-
-It can also be enabled at starttime with "-o track_sizes"
+It can be enabled at starttime with "-o track_sizes"
 
 If disabled, "stats sizes" will return:
-
-STAT sizes_status disabled\r\n
-
-"stats sizes_enable" will return:
-
-STAT sizes_status enabled\r\n
-
-"stats sizes_disable" will return:
 
 STAT sizes_status disabled\r\n
 
@@ -1407,8 +1640,17 @@ If an error happens, it will return:
 STAT sizes_status error\r\n
 STAT sizes_error [error_message]\r\n
 
-CAVEAT: If CAS support is disabled, you cannot enable/disable this feature at
-runtime.
+NOTE: From 1.4.27 to 1.6.24 this feature could be enabled or disabled at
+runtime via `stats sizes_enable` and `stats sizes_disable` - however this
+ability was not thread safe and could crash the server. While possible to fix,
+it would make the feature too slow to be usable.
+
+The feature can still be enabled at start time via `-o track_sizes` and has a
+low overhead.
+
+If you want to make a histogram of item sizes for a memcached instance that is
+already running, you can use `lru_crawler metadump` and process the output.
+This command does not block the server.
 
 Slab statistics
 ---------------
@@ -1509,6 +1751,30 @@ The value of the "state" stat may be one of the following:
 |                | sending back multiple lines of response data).            |
 |----------------+-----------------------------------------------------------|
 
+TLS statistics
+--------------
+
+TLS is a compile-time opt-in feature available in versions 1.5.13 and later.
+When compiled with TLS support and TLS termination is enabled at runtime, the
+following additional statistics are available via the "stats" command.
+
+|--------------------------------+----------+--------------------------------|
+| Name                           | Type     | Meaning                        |
+|--------------------------------+----------+--------------------------------|
+| ssl_handshake_errors           | 64u      | Number of times the server has |
+|                                |          | encountered an OpenSSL error   |
+|                                |          | during handshake (SSL_accept). |
+| ssl_min_version                | char     | Minimum supported TLS version  |
+|                                |          | for client handshakes.         |
+| ssl_new_sessions               | 64u      | When SSL session caching is    |
+|                                |          | enabled, the number of newly   |
+|                                |          | created server-side sessions.  |
+|                                |          | Available only when compiled   |
+|                                |          | with OpenSSL 1.1.1 or newer.   |
+| time_since_server_cert_refresh | 32u      | Number of seconds that have    |
+|                                |          | elapsed since the last time    |
+|                                |          | certs were reloaded from disk. |
+|--------------------------------+----------+--------------------------------|
 
 
 Other commands
@@ -1547,6 +1813,12 @@ be released back to the OS asynchronously.
 
 The argument is in megabytes, not bytes. Input gets multiplied out into
 megabytes internally.
+
+"shutdown" is a command with an optional argument used to stop memcached with
+a kill signal. By default, "shutdown" alone raises SIGINT, though "graceful"
+may be specified as the single argument to instead trigger a graceful shutdown
+with SIGUSR1. The shutdown command is disabled by default, and can be enabled
+with the -A/--enable-shutdown flag.
 
 "version" is a command with no arguments:
 

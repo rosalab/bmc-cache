@@ -2,43 +2,18 @@
 #ifndef CACHE_H
 #define CACHE_H
 #include <pthread.h>
-
-#ifdef HAVE_UMEM_H
-#include <umem.h>
-#define cache_t umem_cache_t
-#define cache_alloc(a) umem_cache_alloc(a, UMEM_DEFAULT)
-#define do_cache_alloc(a) umem_cache_alloc(a, UMEM_DEFAULT)
-#define cache_free(a, b) umem_cache_free(a, b)
-#define do_cache_free(a, b) umem_cache_free(a, b)
-#define cache_create(a,b,c,d,e) umem_cache_create((char*)a, b, c, d, e, NULL, NULL, NULL, 0)
-#define cache_destroy(a) umem_cache_destroy(a);
-
-#else
+#include "queue.h"
 
 #ifndef NDEBUG
 /* may be used for debug purposes */
 extern int cache_error;
 #endif
 
-/**
- * Constructor used to initialize allocated objects
- *
- * @param obj pointer to the object to initialized.
- * @param notused1 This parameter is currently not used.
- * @param notused2 This parameter is currently not used.
- * @return you should return 0, but currently this is not checked
- */
-typedef int cache_constructor_t(void* obj, void* notused1, int notused2);
-/**
- * Destructor used to clean up allocated objects before they are
- * returned to the operating system.
- *
- * @param obj pointer to the object to clean up.
- * @param notused This parameter is currently not used.
- * @return you should return 0, but currently this is not checked
- */
-typedef void cache_destructor_t(void* obj, void* notused);
+struct cache_free_s {
+    STAILQ_ENTRY(cache_free_s) c_next;
+};
 
+//typedef STAILQ_HEAD(cache_head_s, cache_free_s) cache_head_t;
 /**
  * Definition of the structure to keep track of the internal details of
  * the cache allocator. Touching any of these variables results in
@@ -49,18 +24,18 @@ typedef struct {
     pthread_mutex_t mutex;
     /** Name of the cache objects in this cache (provided by the caller) */
     char *name;
-    /** List of pointers to available buffers in this cache */
-    void **ptr;
+    /** freelist of available buffers */
+    STAILQ_HEAD(cache_head, cache_free_s) head;
     /** The size of each element in this cache */
     size_t bufsize;
     /** The capacity of the list of elements */
     int freetotal;
+    /** Total malloc'ed objects */
+    int total;
     /** The current number of free elements */
     int freecurr;
-    /** The constructor to be called each time we allocate more memory */
-    cache_constructor_t* constructor;
-    /** The destructor to be called each time before we release memory */
-    cache_destructor_t* destructor;
+    /** A limit on the total number of elements */
+    int limit;
 } cache_t;
 
 /**
@@ -81,9 +56,8 @@ typedef struct {
  *                   to the os.
  * @return a handle to an object cache if successful, NULL otherwise.
  */
-cache_t* cache_create(const char* name, size_t bufsize, size_t align,
-                      cache_constructor_t* constructor,
-                      cache_destructor_t* destructor);
+cache_t* cache_create(const char* name, size_t bufsize, size_t align);
+
 /**
  * Destroy an object cache.
  *
@@ -114,6 +88,12 @@ void* do_cache_alloc(cache_t* handle);
  */
 void cache_free(cache_t* handle, void* ptr);
 void do_cache_free(cache_t* handle, void* ptr);
-#endif
+/**
+ * Set or adjust a limit for the number of objects to malloc
+ *
+ * @param handle handle to the object cache to adjust
+ * @param limit the number of objects to cache before returning NULL
+ */
+void cache_set_limit(cache_t* handle, int limit);
 
 #endif

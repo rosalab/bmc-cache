@@ -16,11 +16,13 @@
 
 use strict;
 use IO::Socket::INET;
+use URI::Escape;
 
 my $addr = shift;
 my $mode = shift || "display";
 my ($from, $to);
 my $limit;
+my $unescape = 0;
 
 if ($mode eq "display") {
     undef $mode if @ARGV;
@@ -36,6 +38,22 @@ if ($mode eq "display") {
         undef $mode if $limit < 1;
         print STDERR "ERROR: invalid limit (should be a positive number)\n\n" unless $mode;
     }
+} elsif ($mode eq 'keys') {
+    if (@ARGV) {
+        my $arg = shift;
+        if ($arg eq '-u') {
+            $unescape = 1;
+        } else {
+            $limit = $arg;
+        }
+        if (@ARGV) {
+            $limit = shift;
+        }
+        if ($limit) {
+            undef $mode if $limit < 1;
+            print STDERR "ERROR: invalid limit (should be a positive number)\n\n" unless $mode;
+        }
+    }
 } elsif ($mode eq 'stats') {
     ;
 } elsif ($mode eq 'settings') {
@@ -50,12 +68,13 @@ undef $mode if @ARGV;
 
 die
     "Usage: memcached-tool <host[:port] | /path/to/socket> [mode]\n
-       memcached-tool 10.0.0.5:11211 display        # shows slabs
-       memcached-tool 10.0.0.5:11211                # same.  (default is display)
-       memcached-tool 10.0.0.5:11211 stats          # shows general stats
-       memcached-tool 10.0.0.5:11211 settings       # shows settings stats
-       memcached-tool 10.0.0.5:11211 sizes          # shows sizes stats
-       memcached-tool 10.0.0.5:11211 dump [limit]   # dumps keys and values
+       memcached-tool 10.0.0.5:11211 display           # shows slabs
+       memcached-tool 10.0.0.5:11211                   # same.  (default is display)
+       memcached-tool 10.0.0.5:11211 stats             # shows general stats
+       memcached-tool 10.0.0.5:11211 settings          # shows settings stats
+       memcached-tool 10.0.0.5:11211 sizes             # shows sizes stats
+       memcached-tool 10.0.0.5:11211 dump [limit]      # dumps keys and values
+       memcached-tool 10.0.0.5:11211 keys [-u] [limit] # dumps keys (-u: unescape special characters)
 
 WARNING! sizes is a development command.
 As of 1.4 it is still the only command which will lock your memcached instance for some time.
@@ -138,6 +157,25 @@ if ($mode eq 'dump') {
     exit;
 }
 
+if ($mode eq 'keys') {
+    print STDERR "Dumping memcache keys";
+    print STDERR " (limiting to $limit keys)" unless !$limit;
+    print STDERR "\n";
+    print $sock "lru_crawler metadump all\r\n";
+    my %keyexp;
+    my $keycount = 0;
+    while (<$sock>) {
+        last if /^END/ or ($limit and $keycount == $limit);
+        # return format looks like this
+        # key=foo exp=2147483647 la=1521046038 cas=717111 fetch=no cls=13 size=1232
+        if (/^key=(\S+) exp=(-?\d+) .*/) {
+            print ($unescape ? uri_unescape($_) : $_)
+        }
+        $keycount++;
+    }
+    exit;
+}
+
 if ($mode eq 'stats') {
     my %items;
 
@@ -150,9 +188,9 @@ if ($mode eq 'stats') {
             $items{$1} = $2;
         }
     }
-    printf ("#%-17s %5s %11s\n", $addr, "Field", "Value");
+    printf ("#%-22s %5s %13s\n", $addr, "Field", "Value");
     foreach my $name (sort(keys(%items))) {
-        printf ("%24s %12s\n", $name, $items{$name});
+        printf ("%29s %14s\n", $name, $items{$name});
 
     }
     exit;

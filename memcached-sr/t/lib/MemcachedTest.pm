@@ -2,6 +2,7 @@ package MemcachedTest;
 use strict;
 use IO::Socket::INET;
 use IO::Socket::UNIX;
+use POSIX ":sys_wait_h";
 use Exporter 'import';
 use Carp qw(croak);
 use vars qw(@EXPORT);
@@ -13,9 +14,11 @@ my $builddir = getcwd;
 
 my @unixsockets = ();
 
-@EXPORT = qw(new_memcached sleep mem_get_is mem_gets mem_gets_is mem_stats
+@EXPORT = qw(new_memcached sleep
+             mem_get_is mem_gets mem_gets_is mem_stats mem_move_time
              supports_sasl free_port supports_drop_priv supports_extstore
-             wait_ext_flush supports_tls enabled_tls_testing);
+             wait_ext_flush supports_tls enabled_tls_testing run_help
+             supports_unix_socket get_memcached_exe supports_proxy);
 
 use constant MAX_READ_WRITE_SIZE => 16384;
 use constant SRV_CRT => "server_crt.pem";
@@ -68,6 +71,12 @@ sub mem_stats {
         $stats->{$2} = $3;
     }
     return $stats;
+}
+
+sub mem_move_time {
+    my ($sock, $move) = @_;
+    print $sock "debugtime $move\r\n";
+    <$sock>;
 }
 
 sub mem_get_is {
@@ -182,27 +191,45 @@ sub free_port {
     return $port;
 }
 
+sub print_help {
+    my $exe = get_memcached_exe();
+    my $output = `$exe -h`;
+    return $output;
+}
+
 sub supports_udp {
-    my $output = `$builddir/memcached-debug -h`;
+    my $output = print_help();
     return 0 if $output =~ /^memcached 1\.1\./;
     return 1;
 }
 
 sub supports_sasl {
-    my $output = `$builddir/memcached-debug -h`;
+    my $output = print_help();
     return 1 if $output =~ /sasl/i;
     return 0;
 }
 
 sub supports_extstore {
-    my $output = `$builddir/memcached-debug -h`;
+    my $output = print_help();
     return 1 if $output =~ /ext_path/i;
     return 0;
 }
 
+sub supports_proxy {
+    my $output = print_help();
+    return 1 if $output =~ /proxy_config/i;
+    return 0;
+}
+
 sub supports_tls {
-    my $output = `$builddir/memcached-debug -h`;
+    my $output = print_help();
     return 1 if $output =~ /enable-ssl/i;
+    return 0;
+}
+
+sub supports_unix_socket {
+    my $output = print_help();
+    return 1 if $output =~ /unix-socket/i;
     return 0;
 }
 
@@ -218,9 +245,27 @@ sub enabled_tls_testing {
 }
 
 sub supports_drop_priv {
-    my $output = `$builddir/memcached-debug -h`;
+    my $output = print_help();
     return 1 if $output =~ /no_drop_privileges/i;
     return 0;
+}
+
+sub get_memcached_exe {
+    my $exe = "$builddir/memcached-debug";
+    croak("memcached binary doesn't exist.  Haven't run 'make' ?\n") unless -e $exe;
+    croak("memcached binary not executable\n") unless -x _;
+    return $exe;
+}
+
+sub run_help {
+    my $exe = get_memcached_exe();
+    return system("$exe -h");
+}
+
+# -1 if the pid is actually dead.
+sub is_running {
+    return unless defined $_[0];
+    return waitpid($_[0], WNOHANG) >= 0 ? 1 : 0;
 }
 
 sub new_memcached {
@@ -228,6 +273,11 @@ sub new_memcached {
     my $port = $passed_port;
     my $host = '127.0.0.1';
     my $ssl_enabled  = enabled_tls_testing();
+    my $unix_socket_disabled  = !supports_unix_socket();
+    my $use_external = 0;
+    if ($ENV{T_MEMD_EXTERNAL}) {
+        $use_external = $ENV{T_MEMD_EXTERNAL};
+    }
 
     if ($ENV{T_MEMD_USE_DAEMON}) {
         my ($host, $port) = ($ENV{T_MEMD_USE_DAEMON} =~ m/^([^:]+):(\d+)$/);
@@ -256,7 +306,7 @@ sub new_memcached {
     $args .= " -o relaxed_privileges";
 
     my $udpport;
-    if ($args =~ /-l (\S+)/ || ($ssl_enabled && ($args !~ /-s (\S+)/))) {
+    if ($args =~ /-l (\S+)/ || (($ssl_enabled || $unix_socket_disabled) && ($args !~ /-s (\S+)/))) {
         if (!$port) {
             $port = free_port();
         }
@@ -266,45 +316,80 @@ sub new_memcached {
             $args .= " -U $udpport";
         }
         if ($ssl_enabled) {
-            $args .= " -Z -o ssl_chain_cert=$server_crt -o ssl_key=$server_key";
+            $args .= " -Z";
+            if ($args !~ /-o ssl_chain_cert=(\S+)/) {
+                $args .= " -o ssl_chain_cert=$server_crt";
+            }
+            if ($args !~ /-o ssl_key=(\S+)/) {
+                $args .= " -o ssl_key=$server_key";
+            }
         }
     } elsif ($args !~ /-s (\S+)/) {
         my $num = @unixsockets;
         my $file = "/tmp/memcachetest.$$.$num";
+        if ($use_external) {
+            $file = "/tmp/memcachedtest.$use_external.$num";
+        }
         $args .= " -s $file";
         push(@unixsockets, $file);
     }
 
-    my $childpid = fork();
+    my $wait_tries = 60;
+    my $exe = get_memcached_exe();
+    my $childpid;
+    if ($use_external) {
+        print STDERR "External daemon requested. Start arguments:\n$exe $args\n";
+        $wait_tries = 10000;
+        $childpid;
+    } else {
+        $childpid = fork();
 
-    my $exe = "$builddir/memcached-debug";
-    croak("memcached binary doesn't exist.  Haven't run 'make' ?\n") unless -e $exe;
-    croak("memcached binary not executable\n") unless -x _;
-
-    unless ($childpid) {
-        #print STDERR "RUN: $exe $args\n";
-        exec "$builddir/timedrun 600 $exe $args";
-        exit; # never gets here.
+        unless ($childpid) {
+            my $valgrind = "";
+            my $valgrind_args = "--quiet --error-exitcode=1 --exit-on-first-error=yes";
+            if ($ENV{VALGRIND_ARGS}) {
+                $valgrind_args = $ENV{VALGRIND_ARGS};
+            }
+            if ($ENV{VALGRIND_TEST}) {
+                $valgrind = "valgrind $valgrind_args";
+                # NOTE: caller file stuff.
+                $valgrind .= " $ENV{VALGRIND_EXTRA_ARGS}";
+            }
+            my $cmd = "$builddir/timedrun 600 $valgrind $exe $args";
+            #print STDERR "RUN: $cmd\n\n";
+            exec $cmd;
+            exit; # never gets here.
+        }
     }
 
     # unix domain sockets
     if ($args =~ /-s (\S+)/) {
-        sleep 1;
+        # A slow/emulated/valgrinded/etc system may take longer than a second
+        # for the unix socket to appear.
         my $filename = $1;
-        my $conn = IO::Socket::UNIX->new(Peer => $filename) ||
-            croak("Failed to connect to unix domain socket: $! '$filename'");
+        for (1..$wait_tries) {
+            my $conn = IO::Socket::UNIX->new(Peer => $filename);
 
-        return Memcached::Handle->new(pid  => $childpid,
-                                      conn => $conn,
-                                      domainsocket => $filename,
-                                      host => $host,
-                                      port => $port);
+            if ($conn) {
+                return Memcached::Handle->new(pid  => $childpid,
+                                              conn => $conn,
+                                              domainsocket => $filename,
+                                              host => $host,
+                                              port => $port);
+            } else {
+                if (!$ENV{T_MEMD_EXTERNAL}) {
+                    croak("Failed to connect to unix socket: memcached not running") unless is_running($childpid);
+                }
+                select undef, undef, undef, 0.20;
+            }
+        }
+        croak("Failed to connect to unix domain socket: $! '$filename'") if $@;
     }
 
     # try to connect / find open port, only if we're not using unix domain
     # sockets
 
-    for (1..20) {
+    for (1..80) {
         my $conn;
         if ($ssl_enabled) {
             $conn = eval qq{ IO::Socket::SSL->new(PeerAddr => "127.0.0.1:$port",
@@ -323,7 +408,8 @@ sub new_memcached {
                                           host => $host,
                                           port => $port);
         }
-        select undef, undef, undef, 0.10;
+        croak("Failed to connect: memcached not running") unless is_running($childpid);
+        select undef, undef, undef, 0.25;
     }
     croak("Failed to startup/connect to memcached server.");
 }
@@ -336,6 +422,7 @@ END {
 
 ############################################################################
 package Memcached::Handle;
+use POSIX ":sys_wait_h";
 sub new {
     my ($class, %params) = @_;
     return bless \%params, $class;
@@ -343,17 +430,48 @@ sub new {
 
 sub DESTROY {
     my $self = shift;
-    kill 2, $self->{pid};
+    if ($self->{pid}) {
+        kill 2, $self->{pid};
+    } else {
+        print STDERR "WANT TO ISSUE KILL: 2\n";
+    }
 }
 
 sub stop {
     my $self = shift;
-    kill 15, $self->{pid};
+    if ($self->{pid}) {
+        kill 15, $self->{pid};
+    } else {
+        print STDERR "WANT TO ISSUE KILL: 15\n";
+    }
 }
 
 sub graceful_stop {
     my $self = shift;
-    kill 'SIGUSR1', $self->{pid};
+    if ($self->{pid}) {
+        kill 'SIGUSR1', $self->{pid};
+    } else {
+        print STDERR "WANT TO ISSUE KILL: SIGUSR1\n";
+    }
+}
+
+sub reload {
+    my $self = shift;
+    if ($self->{pid}) {
+        kill 'SIGHUP', $self->{pid};
+    } else {
+        print STDERR "WANT TO ISSUE KILL: SIGHUP\n";
+    }
+}
+
+# -1 if the pid is actually dead.
+sub is_running {
+    my $self = shift;
+    if ($self->{pid}) {
+        return waitpid($self->{pid}, WNOHANG) >= 0 ? 1 : 0;
+    } else {
+        print STDERR "WANTED TO CHECK IF DAEMON IS RUNNING\n";
+    }
 }
 
 sub host { $_[0]{host} }
@@ -374,8 +492,12 @@ sub new_sock {
     if ($self->{domainsocket}) {
         return IO::Socket::UNIX->new(Peer => $self->{domainsocket});
     } elsif (MemcachedTest::enabled_tls_testing()) {
+        my $ssl_session_cache = shift;
+        my $ssl_version = shift;
         return eval qq{ IO::Socket::SSL->new(PeerAddr => "$self->{host}:$self->{port}",
                                     SSL_verify_mode => IO::Socket::SSL::SSL_VERIFY_NONE,
+                                    SSL_session_cache => \$ssl_session_cache,
+                                    SSL_version => '$ssl_version',
                                     SSL_cert_file => '$client_crt',
                                     SSL_key_file => '$client_key');
                                     };
@@ -393,6 +515,226 @@ sub new_udp_sock {
                                  LocalPort => MemcachedTest::free_port('udp'),
         );
 
+}
+
+############################################################################
+package Memcached::ProxyTest;
+use IO::Socket qw(AF_INET SOCK_STREAM);
+# We call out to Test::More because of some package instancing. Not completely
+# sure if this is necessary anymore?
+use strict;
+use warnings;
+
+sub new {
+    my ($class, %p) = @_;
+
+    die "needs servers argument"
+        unless exists $p{servers} && ref($p{servers}) eq 'ARRAY';
+
+    $p{_srv} = [];
+    for my $port (@{$p{servers}}) {
+        my $srv = _mock_server($port);
+        Test::More::ok(defined $srv, "mock server object created");
+        push(@{$p{_srv}}, $srv);
+    }
+
+    $p{_csel} = IO::Select->new();
+
+    return bless \%p, $class;
+}
+
+sub _mock_server {
+    my $port = shift;
+    my $srv = IO::Socket->new(
+        Domain => AF_INET,
+        Type => SOCK_STREAM,
+        Proto => 'tcp',
+        LocalHost => '127.0.0.1',
+        LocalPort => $port,
+        ReusePort => 1,
+        Listen => 5) || die "IO::Socket: $@";
+    return $srv;
+}
+
+sub _accept_backend {
+    my $srv = shift;
+    my $be = $srv->accept();
+    $be->autoflush(1);
+    Test::More::ok(defined $be, "mock backend created");
+    Test::More::like(<$be>, qr/version/, "received version command");
+    my $sent = $be->send("VERSION 1.0.0-mock\r\n");
+    Test::More::cmp_ok($sent, '>', 0, "wrote VERSION back to backend");
+
+    return $be;
+}
+
+sub accept_backends {
+    my $self = shift;
+    $self->{_be} = [];
+    for my $srv (@{$self->{_srv}}) {
+        my $be = _accept_backend($srv);
+        push(@{$self->{_be}}, $be);
+    }
+}
+
+sub accept_backend {
+    my $self = shift;
+    my $idx = shift;
+    $self->{_be}->[$idx] = _accept_backend($self->{_srv}->[$idx]);
+}
+
+sub close_backend {
+    my $self = shift;
+    my $idx = shift;
+    $self->{_be}->[$idx]->close;
+}
+
+sub srv_accept_waiting {
+    my $self = shift;
+    my $idx = shift;
+    my $wait = shift || 1;
+    my $s = IO::Select->new();
+    $s->add($self->{_srv}->[$idx]);
+    return $s->can_read($wait);
+}
+
+sub set_c {
+    my $self = shift;
+    my $sel = $self->{_csel};
+    if (exists $self->{_c}) {
+        $sel->remove($self->{_c});
+    }
+    $self->{_c} = shift;
+    $sel->add($self->{_c});
+}
+
+sub check_c {
+    my $self = shift;
+    my $c = $self->{_c};
+    print $c "version\r\n";
+    Test::More::like(scalar <$c>, qr/VERSION /, "version received");
+}
+
+sub wait_c {
+    my ($self, $wait) = @_;
+    return $self->{_csel}->can_read($wait);
+}
+
+# Remembers the last command sent to the client socket.
+sub c_send {
+    my $self = shift;
+    my $cmd = shift;
+    my $c = $self->{_c};
+    print $c $cmd;
+    $self->{_cmd} = $cmd;
+}
+
+# Backends can be specified as a bare number, and array reference ([0,1,2]),
+# or 'all' to run against all available backends.
+sub _be_list {
+    my $self = shift;
+    my $list = shift;
+    my @l = ();
+    if (ref $list eq '') {
+        if (exists $self->{_be}->[$list]) {
+            push(@l, $self->{_be}->[$list]);
+        } elsif ($list eq 'all') {
+            @l = @{$self->{_be}};
+        } else {
+            die "unknown argument";
+        }
+    } elsif (ref $list eq 'ARRAY') {
+        for my $i (@$list) {
+            push(@l, $self->{_be}->[$i]);
+        }
+    }
+    return \@l;
+}
+
+# Check that the last command sent to the client arrives at the backends.
+# This is a common case so this saves typing/errors while writing tests.
+sub be_recv_c {
+    my $self = shift;
+    my $list = shift;
+    my $detail = shift || 'be received data';
+    die "issue a a command with c_send before calling be_recv_c" unless exists $self->{_cmd};
+
+    my $l = $self->_be_list($list);
+    my $cmd = $self->{_cmd};
+    my @cmds = split(/(?<=\r\n)/, $cmd);
+    for my $be (@$l) {
+        for my $c (@cmds) {
+            Test::More::is(scalar <$be>, $c, $detail);
+        }
+    }
+}
+
+sub be_recv_like {
+    my $self = shift;
+    my $list = shift;
+    my $cmd = shift || die "must provide a command to check";
+    my $detail = shift || 'be received data';
+
+    my $l = $self->_be_list($list);
+    for my $be (@$l) {
+        Test::More::like(scalar <$be>, $cmd, $detail);
+    }
+}
+
+# Receive a different/specific string to the backend socket.
+sub be_recv {
+    my $self = shift;
+    my $list = shift;
+    my $cmd = shift || die "must provide a command to check";
+    my $detail = shift || 'be received data';
+
+    my $l = $self->_be_list($list);
+    for my $be (@$l) {
+        Test::More::is(scalar <$be>, $cmd, $detail);
+    }
+}
+
+# Sends a specific command to a backend socket back towards the proxy.
+# Remembers the last command sent.
+sub be_send {
+    my $self = shift;
+    my $list = shift;
+    my $cmd = shift || die "must provide data to return";
+
+    $self->{_becmd} = $cmd;
+    my $l = $self->_be_list($list);
+    for my $be (@$l) {
+        print $be $cmd;
+    }
+}
+
+# Client receives the last command sent to any backend. This is also a common
+# case so we save some typing/errors by remembering this here.
+sub c_recv_be {
+    my $self = shift;
+    my $detail = shift || 'client received be response';
+
+    my $cmd = $self->{_becmd};
+    my $c = $self->{_c};
+    Test::More::is(scalar <$c>, $cmd, $detail);
+}
+
+# Client to receive an arbitrary string.
+sub c_recv {
+    my $self = shift;
+    my $cmd = shift;
+    my $detail = shift || 'client received response';
+
+    my $c = $self->{_c};
+    Test::More::is(scalar <$c>, $cmd, $detail);
+}
+
+# Clear out any remembered commands and check the client pipe is clear.
+sub clear {
+    my $self = shift;
+    delete $self->{_becmd} if exists $self->{_becmd};
+    delete $self->{_cmd} if exists $self->{_cmd};
+    $self->check_c();
 }
 
 1;

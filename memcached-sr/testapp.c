@@ -20,6 +20,10 @@
 
 #include "config.h"
 #include "cache.h"
+#include "crc32c.h"
+#include "hash.h"
+#include "jenkins_hash.h"
+#include "stats_prefix.h"
 #include "util.h"
 #include "protocol_binary.h"
 #ifdef TLS
@@ -40,6 +44,7 @@ struct conn {
     ssize_t (*write)(struct conn *c, const void *buf, size_t count);
 };
 
+hash_func hash;
 
 static ssize_t tcp_read(struct conn *c, void *buf, size_t count);
 static ssize_t tcp_write(struct conn *c, const void *buf, size_t count);
@@ -75,7 +80,7 @@ static struct conn *con = NULL;
 static bool allow_closed_read = false;
 static bool enable_ssl = false;
 
-static void close_conn() {
+static void close_conn(void) {
     if (con == NULL) return;
 #ifdef TLS
     if (con->ssl) {
@@ -92,75 +97,19 @@ static void close_conn() {
 
 static enum test_return cache_create_test(void)
 {
-    cache_t *cache = cache_create("test", sizeof(uint32_t), sizeof(char*),
-                                  NULL, NULL);
+    cache_t *cache = cache_create("test", sizeof(uint32_t), sizeof(char*));
     assert(cache != NULL);
     cache_destroy(cache);
     return TEST_PASS;
 }
 
-const uint64_t constructor_pattern = 0xdeadcafebabebeef;
-
-static int cache_constructor(void *buffer, void *notused1, int notused2) {
-    uint64_t *ptr = buffer;
-    *ptr = constructor_pattern;
-    return 0;
-}
-
-static enum test_return cache_constructor_test(void)
-{
-    cache_t *cache = cache_create("test", sizeof(uint64_t), sizeof(uint64_t),
-                                  cache_constructor, NULL);
-    assert(cache != NULL);
-    uint64_t *ptr = cache_alloc(cache);
-    uint64_t pattern = *ptr;
-    cache_free(cache, ptr);
-    cache_destroy(cache);
-    return (pattern == constructor_pattern) ? TEST_PASS : TEST_FAIL;
-}
-
-static int cache_fail_constructor(void *buffer, void *notused1, int notused2) {
-    return 1;
-}
-
-static enum test_return cache_fail_constructor_test(void)
-{
-    enum test_return ret = TEST_PASS;
-
-    cache_t *cache = cache_create("test", sizeof(uint64_t), sizeof(uint64_t),
-                                  cache_fail_constructor, NULL);
-    assert(cache != NULL);
-    uint64_t *ptr = cache_alloc(cache);
-    if (ptr != NULL) {
-        ret = TEST_FAIL;
-    }
-    cache_destroy(cache);
-    return ret;
-}
-
-static void *destruct_data = 0;
-
-static void cache_destructor(void *buffer, void *notused) {
-    destruct_data = buffer;
-}
-
-static enum test_return cache_destructor_test(void)
-{
-    cache_t *cache = cache_create("test", sizeof(uint32_t), sizeof(char*),
-                                  NULL, cache_destructor);
-    assert(cache != NULL);
-    char *ptr = cache_alloc(cache);
-    cache_free(cache, ptr);
-    cache_destroy(cache);
-
-    return (ptr == destruct_data) ? TEST_PASS : TEST_FAIL;
-}
-
 static enum test_return cache_reuse_test(void)
 {
     int ii;
-    cache_t *cache = cache_create("test", sizeof(uint32_t), sizeof(char*),
-                                  NULL, NULL);
+    cache_t *cache = cache_create("test", sizeof(uint32_t), sizeof(char*));
+    if (cache == NULL) {
+        return TEST_FAIL;
+    }
     char *ptr = cache_alloc(cache);
     cache_free(cache, ptr);
     for (ii = 0; ii < 100; ++ii) {
@@ -175,8 +124,10 @@ static enum test_return cache_reuse_test(void)
 
 static enum test_return cache_bulkalloc(size_t datasize)
 {
-    cache_t *cache = cache_create("test", datasize, sizeof(char*),
-                                  NULL, NULL);
+    cache_t *cache = cache_create("test", datasize, sizeof(char*));
+    if (cache == NULL) {
+        return TEST_FAIL;
+    }
 #define ITERATIONS 1024
     void *ptr[ITERATIONS];
 
@@ -208,9 +159,11 @@ static enum test_return test_issue_161(void)
 static enum test_return cache_redzone_test(void)
 {
 #ifndef HAVE_UMEM_H
-    cache_t *cache = cache_create("test", sizeof(uint32_t), sizeof(char*),
-                                  NULL, NULL);
+    cache_t *cache = cache_create("test", sizeof(uint32_t), sizeof(char*));
 
+    if (cache == NULL) {
+        return TEST_FAIL;
+    }
     /* Ignore SIGABRT */
     struct sigaction old_action;
     struct sigaction action = { .sa_handler = SIG_IGN, .sa_flags = 0};
@@ -240,6 +193,186 @@ static enum test_return cache_redzone_test(void)
 #endif
 }
 
+static enum test_return cache_limit_revised_downward_test(void)
+{
+    int limit = 10, allocated_num = limit + 1, i;
+    char ** alloc_objs = calloc(allocated_num, sizeof(char *));
+
+    cache_t *cache = cache_create("test", sizeof(uint32_t), sizeof(char*));
+    assert(cache != NULL);
+
+    /* cache->limit is 0 and we can allocate limit+1 items */
+    for (i = 0; i < allocated_num; i++) {
+        alloc_objs[i] = cache_alloc(cache);
+        assert(alloc_objs[i] != NULL);
+    }
+    assert(cache->total == allocated_num);
+
+    /* revised downward cache->limit */
+    cache_set_limit(cache, limit);
+
+    /* If we free one item, the cache->total should decreased by one*/
+    cache_free(cache, alloc_objs[0]);
+
+    assert(cache->total == allocated_num-1);
+    cache_destroy(cache);
+
+    free(alloc_objs);
+
+    return TEST_PASS;
+}
+
+static enum test_return test_stats_prefix_find(void) {
+    PREFIX_STATS *pfs1, *pfs2;
+
+    stats_prefix_clear();
+    pfs1 = stats_prefix_find("abc", 3);
+    assert(pfs1 == NULL);
+    pfs1 = stats_prefix_find("abc|", 4);
+    assert(pfs1 == NULL);
+
+    pfs1 = stats_prefix_find("abc:", 4);
+    assert(pfs1 != NULL);
+    assert(0ULL == (pfs1->num_gets + pfs1->num_sets + pfs1->num_deletes + pfs1->num_hits));
+    pfs2 = stats_prefix_find("abc:", 4);
+    assert(pfs1 == pfs2);
+    pfs2 = stats_prefix_find("abc:d", 5);
+    assert(pfs1 == pfs2);
+    pfs2 = stats_prefix_find("xyz123:", 6);
+    assert(pfs1 != pfs2);
+    pfs2 = stats_prefix_find("ab:", 3);
+    assert(pfs1 != pfs2);
+    return TEST_PASS;
+}
+
+static enum test_return test_stats_prefix_record_get(void) {
+    PREFIX_STATS *pfs;
+    stats_prefix_clear();
+
+    stats_prefix_record_get("abc:123", 7, false);
+    pfs = stats_prefix_find("abc:123", 7);
+    if (pfs == NULL) {
+        return TEST_FAIL;
+    }
+    assert(1 == pfs->num_gets);
+    assert(0 == pfs->num_hits);
+    stats_prefix_record_get("abc:456", 7, false);
+    assert(2 == pfs->num_gets);
+    assert(0 == pfs->num_hits);
+    stats_prefix_record_get("abc:456", 7, true);
+    assert(3 == pfs->num_gets);
+    assert(1 == pfs->num_hits);
+    stats_prefix_record_get("def:", 4, true);
+    assert(3 == pfs->num_gets);
+    assert(1 == pfs->num_hits);
+    return TEST_PASS;
+}
+
+static enum test_return test_stats_prefix_record_delete(void) {
+    PREFIX_STATS *pfs;
+    stats_prefix_clear();
+
+    stats_prefix_record_delete("abc:123", 7);
+    pfs = stats_prefix_find("abc:123", 7);
+    if (pfs == NULL) {
+        return TEST_FAIL;
+    }
+    assert(0 == pfs->num_gets);
+    assert(0 == pfs->num_hits);
+    assert(1 == pfs->num_deletes);
+    assert(0 == pfs->num_sets);
+    stats_prefix_record_delete("def:", 4);
+    assert(1 == pfs->num_deletes);
+    return TEST_PASS;
+}
+
+static enum test_return test_stats_prefix_record_set(void) {
+    PREFIX_STATS *pfs;
+    stats_prefix_clear();
+
+    stats_prefix_record_set("abc:123", 7);
+    pfs = stats_prefix_find("abc:123", 7);
+    if (pfs == NULL) {
+        return TEST_FAIL;
+    }
+    assert(0 == pfs->num_gets);
+    assert(0 == pfs->num_hits);
+    assert(0 == pfs->num_deletes);
+    assert(1 == pfs->num_sets);
+    stats_prefix_record_delete("def:", 4);
+    assert(1 == pfs->num_sets);
+    return TEST_PASS;
+}
+
+static enum test_return test_stats_prefix_dump(void) {
+    int hashval = hash("abc", 3) % PREFIX_HASH_SIZE;
+    char tmp[500];
+    char *buf;
+    const char *expected;
+    int keynum;
+    int length;
+
+    stats_prefix_clear();
+
+    assert(strcmp("END\r\n", (buf = stats_prefix_dump(&length))) == 0);
+    assert(5 == length);
+    stats_prefix_record_set("abc:123", 7);
+    free(buf);
+    expected = "PREFIX abc get 0 hit 0 set 1 del 0\r\nEND\r\n";
+    assert(strcmp(expected, (buf = stats_prefix_dump(&length))) == 0);
+    assert(strlen(expected) == length);
+    stats_prefix_record_get("abc:123", 7, false);
+    free(buf);
+    expected = "PREFIX abc get 1 hit 0 set 1 del 0\r\nEND\r\n";
+    assert(strcmp(expected, (buf = stats_prefix_dump(&length))) == 0);
+    assert(strlen(expected) == length);
+    stats_prefix_record_get("abc:123", 7, true);
+    free(buf);
+    expected = "PREFIX abc get 2 hit 1 set 1 del 0\r\nEND\r\n";
+    assert(strcmp(expected, (buf = stats_prefix_dump(&length))) == 0);
+    assert(strlen(expected) == length);
+    stats_prefix_record_delete("abc:123", 7);
+    free(buf);
+    expected = "PREFIX abc get 2 hit 1 set 1 del 1\r\nEND\r\n";
+    assert(strcmp(expected, (buf = stats_prefix_dump(&length))) == 0);
+    assert(strlen(expected) == length);
+
+    stats_prefix_record_delete("def:123", 7);
+    free(buf);
+    /* NOTE: Prefixes can be dumped in any order, so we verify that
+       each expected line is present in the string. */
+    buf = stats_prefix_dump(&length);
+    assert(strstr(buf, "PREFIX abc get 2 hit 1 set 1 del 1\r\n") != NULL);
+    assert(strstr(buf, "PREFIX def get 0 hit 0 set 0 del 1\r\n") != NULL);
+    assert(strstr(buf, "END\r\n") != NULL);
+    free(buf);
+
+    /* Find a key that hashes to the same bucket as "abc" */
+    bool found_match = false;
+    for (keynum = 0; keynum < PREFIX_HASH_SIZE * 100; keynum++) {
+        snprintf(tmp, sizeof(tmp), "%d:", keynum);
+        /* -1 because only the prefix portion is used when hashing */
+        if (hashval == hash(tmp, strlen(tmp) - 1) % PREFIX_HASH_SIZE) {
+            found_match = true;
+            break;
+        }
+    }
+    assert(found_match);
+    stats_prefix_record_set(tmp, strlen(tmp));
+    buf = stats_prefix_dump(&length);
+    assert(strstr(buf, "PREFIX abc get 2 hit 1 set 1 del 1\r\n") != NULL);
+    assert(strstr(buf, "PREFIX def get 0 hit 0 set 0 del 1\r\n") != NULL);
+    assert(strstr(buf, "END\r\n") != NULL);
+    snprintf(tmp, sizeof(tmp), "PREFIX %d get 0 hit 0 set 1 del 0\r\n", keynum);
+    assert(strstr(buf, tmp) != NULL);
+    free(buf);
+
+    /* Marking the end of these tests */
+    stats_prefix_clear();
+
+    return TEST_PASS;
+}
+
 static enum test_return test_safe_strtoul(void) {
     uint32_t val;
     assert(safe_strtoul("123", &val));
@@ -260,6 +393,14 @@ static enum test_return test_safe_strtoul(void) {
        assert(!safe_strtoul("4294967296", &val)); // 2**32
     */
     assert(!safe_strtoul("-1", &val));  // negative
+
+    // huge number, with a negative sign _past_ the value
+    if (sizeof(unsigned long) > 4) {
+        assert(safe_strtoul("18446744073709551615\r\nextrastring-morestring", &val));
+    } else {
+        assert(safe_strtoul("4294967295\r\nextrastring-morestring", &val));
+    }
+
     return TEST_PASS;
 }
 
@@ -280,6 +421,9 @@ static enum test_return test_safe_strtoull(void) {
     assert(val == 18446744073709551615ULL);
     assert(!safe_strtoull("18446744073709551616", &val)); // 2**64
     assert(!safe_strtoull("-1", &val));  // negative
+
+    // huge number, with a negative sign _past_ the value
+    assert(safe_strtoull("18446744073709551615\r\nextrastring-morestring", &val));
     return TEST_PASS;
 }
 
@@ -373,7 +517,6 @@ static pid_t start_server(in_port_t *port_out, bool daemon, int timeout) {
 
     pid_t pid = fork();
     assert(pid != -1);
-
     if (pid == 0) {
         /* Child */
         char *argv[24];
@@ -428,8 +571,16 @@ static pid_t start_server(in_port_t *port_out, bool daemon, int timeout) {
     }
 
     /* Yeah just let us "busy-wait" for the file to be created ;-) */
-    while (access(filename, F_OK) == -1) {
-        usleep(10);
+    useconds_t wait_timeout = 1000000 * 10;
+    useconds_t wait = 1000;
+    while (access(filename, F_OK) == -1 && wait_timeout > 0) {
+        usleep(wait);
+        wait_timeout -= (wait > wait_timeout ? wait_timeout : wait);
+    }
+
+    if (access(filename, F_OK) == -1) {
+        fprintf(stderr, "Failed to start the memcached server.\n");
+        assert(false);
     }
 
     FILE *fp = fopen(filename, "r");
@@ -483,7 +634,7 @@ static pid_t start_server(in_port_t *port_out, bool daemon, int timeout) {
 
 static enum test_return test_issue_44(void) {
     in_port_t port;
-    pid_t pid = start_server(&port, true, 15);
+    pid_t pid = start_server(&port, true, 600);
     assert(kill(pid, SIGHUP) == 0);
     sleep(1);
     assert(kill(pid, SIGTERM) == 0);
@@ -696,6 +847,34 @@ static enum test_return test_issue_92(void) {
     close_conn();
     con = connect_server("127.0.0.1", port, false, enable_ssl);
     assert(con);
+    return TEST_PASS;
+}
+
+static enum test_return test_crc32c(void) {
+    uint32_t crc_hw, crc_sw;
+
+    char buffer[256];
+    for (int x = 0; x < 256; x++)
+        buffer[x] = x;
+
+    /* Compare hardware to software implementation */
+    crc_hw = crc32c(0, buffer, 256);
+    crc_sw = crc32c_sw(0, buffer, 256);
+    assert(crc_hw == 0x9c44184b);
+    assert(crc_sw == 0x9c44184b);
+
+    /* Test that passing a CRC in also works */
+    crc_hw = crc32c(crc_hw, buffer, 256);
+    crc_sw = crc32c_sw(crc_sw, buffer, 256);
+    assert(crc_hw == 0xae10ee5a);
+    assert(crc_sw == 0xae10ee5a);
+
+    /* Test odd offsets/sizes */
+    crc_hw = crc32c(crc_hw, buffer + 1, 256 - 2);
+    crc_sw = crc32c_sw(crc_sw, buffer + 1, 256 - 2);
+    assert(crc_hw == 0xed37b906);
+    assert(crc_sw == 0xed37b906);
+
     return TEST_PASS;
 }
 
@@ -1845,7 +2024,7 @@ static void *binary_hickup_recv_verification_thread(void *arg) {
 
 static enum test_return test_binary_pipeline_hickup_chunk(void *buffer, size_t buffersize) {
     off_t offset = 0;
-    char *key[256];
+    char *key[256] = { NULL };
     uint64_t value = 0xfeedfacedeadbeef;
 
     while (hickup_thread_running &&
@@ -2044,6 +2223,7 @@ static enum test_return test_issue_101(void) {
         con = connect_server("127.0.0.1", port, false, enable_ssl);
         assert(con);
         ret = test_binary_noop();
+        close_conn();
         exit(0);
     }
 
@@ -2078,11 +2258,14 @@ struct testcase {
 
 struct testcase testcases[] = {
     { "cache_create", cache_create_test },
-    { "cache_constructor", cache_constructor_test },
-    { "cache_constructor_fail", cache_fail_constructor_test },
-    { "cache_destructor", cache_destructor_test },
     { "cache_reuse", cache_reuse_test },
     { "cache_redzone", cache_redzone_test },
+    { "cache_limit_revised_downward", cache_limit_revised_downward_test },
+    { "stats_prefix_find", test_stats_prefix_find },
+    { "stats_prefix_record_get", test_stats_prefix_record_get },
+    { "stats_prefix_record_delete", test_stats_prefix_record_delete },
+    { "stats_prefix_record_set", test_stats_prefix_record_set },
+    { "stats_prefix_dump", test_stats_prefix_dump },
     { "issue_161", test_issue_161 },
     { "strtol", test_safe_strtol },
     { "strtoll", test_safe_strtoll },
@@ -2091,6 +2274,7 @@ struct testcase testcases[] = {
     { "issue_44", test_issue_44 },
     { "vperror", test_vperror },
     { "issue_101", test_issue_101 },
+    { "crc32c", test_crc32c },
     /* The following tests all run towards the same server */
     { "start_server", start_memcached_server },
     { "issue_92", test_issue_92 },
@@ -2133,6 +2317,14 @@ struct testcase testcases[] = {
     { NULL, NULL }
 };
 
+/* Stub out function defined in memcached.c */
+void STATS_LOCK(void);
+void STATS_UNLOCK(void);
+void STATS_LOCK(void)
+{}
+void STATS_UNLOCK(void)
+{}
+
 int main(int argc, char **argv)
 {
     int exitcode = 0;
@@ -2144,6 +2336,12 @@ int main(int argc, char **argv)
         enable_ssl = true;
     }
 #endif
+    /* Initialized directly instead of using hash_init to avoid pulling in
+       the definition of settings struct from memcached.h */
+    hash = jenkins_hash;
+    stats_prefix_init(':');
+
+    crc32c_init();
 
     for (num_cases = 0; testcases[num_cases].description; num_cases++) {
         /* Just counting */

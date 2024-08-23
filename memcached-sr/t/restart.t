@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/bin/env perl
 
 use strict;
 use warnings;
@@ -12,8 +12,23 @@ use MemcachedTest;
 # /dev/shm.
 my $mem_path = "/tmp/mc_restart.$$";
 
+# read a invalid metadata file
+{
+    my $meta_path = "$mem_path.meta";
+    open(my $f, "> $meta_path") || die("Can't open a metadata file.");
+    eval {  new_memcached("-e $mem_path"); };
+    unlink($meta_path);
+    ok($@, "Died with an empty metadata file");
+}
+
 my $server = new_memcached("-m 128 -e $mem_path -I 2m");
 my $sock = $server->sock;
+
+diag "restart basic stats";
+{
+    my $stats = mem_stats($server->sock, ' settings');
+    is($stats->{memory_file}, $mem_path);
+}
 
 diag "Set some values, various sizes.";
 {
@@ -60,6 +75,7 @@ diag "load enough items to change hash power level";
 }
 
 diag "Load a couple chunked items";
+my $deleted_chunked_item = 0;
 {
     my $cur = 768000;
     my $cnt = 0;
@@ -71,11 +87,16 @@ diag "Load a couple chunked items";
         $cur += 50;
         $cnt++;
     }
+    # delete the last one.
+    $cnt--;
+    $deleted_chunked_item = $cnt;
+    print $sock "delete chunk${cnt}\r\n";
+    like(scalar <$sock>, qr/DELETED/, "deleted $cnt from large chunked items");
 }
 
 diag "Data that should expire while stopped.";
 {
-    print $sock "set low1 0 8 2\r\nbo\r\n";
+    print $sock "set low1 0 5 2\r\nbo\r\n";
     like(scalar <$sock>, qr/STORED/, "stored low ttl item");
     # This one should stay.
     print $sock "set low2 0 20 2\r\nmo\r\n";
@@ -131,7 +152,9 @@ diag "low TTL item should be gone";
     my $end = $cur + 1024;
     while ($cur <= $end) {
         my $val = 'x' x $cur;
-        mem_get_is($sock, 'chunk' . $cnt, $val);
+        if ($cnt != $deleted_chunked_item) {
+            mem_get_is($sock, 'chunk' . $cnt, $val);
+        }
         $cur += 50;
         $cnt++;
     }
