@@ -224,36 +224,40 @@ int main(int argc, char *argv[])
 
 	struct bpf_program *pos;
 	const char *sec_name;
+	const char *name;
 	int i = 0;
-
+	
 	bpf_object__for_each_program(pos, obj) {
-		i = i+1;
+		progs[i].prog = pos;
 		sec_name = bpf_program__section_name(pos);
+		name = bpf_program__name(pos);
 		if (!sec_name) {
 			fprintf(stderr, "Error: bpf_program__section_name failed\n");
 			return 1;
 		}
-		bpf_program__set_type(progs[i].prog, progs[i].type);
+		printf("sec_name: %s, type: %d, name: %s, bpf_program__name: %s, prog: %p\n", sec_name, bpf_program__type(pos), progs[i].name, name, progs[i].prog);
+		bpf_program__set_type(pos, progs[i].type);
+		i = i+1;
 	}
-
+	
 	/* load BPF program */
 	if (bpf_object__load(obj)) {
 		fprintf(stderr, "ERROR: loading BPF object file failed\n");
-	}
+	} 
 
 	map_progs_xdp_fd = bpf_object__find_map_fd_by_name(obj, "map_progs_xdp");
 	if (map_progs_xdp_fd < 0) {
 		fprintf(stderr, "Error: bpf_object__find_map_fd_by_name failed\n");
 		return 1;
 	}
-
 	map_progs_tc_fd = bpf_object__find_map_fd_by_name(obj, "map_progs_tc");
 	if (map_progs_tc_fd < 0) {
 		fprintf(stderr, "Error: bpf_object__find_map_fd_by_name failed\n");
 		return 1;
-	}
+	} printf("Reached line 254\n"); 
 
 	for (int i = 0; i < prog_count; i++) {
+		printf("Program pointer: %p\n", progs[i].prog);
 		int prog_fd = bpf_program__fd(progs[i].prog);
 
 		if (prog_fd < 0) {
@@ -285,7 +289,7 @@ int main(int argc, char *argv[])
 				fprintf(stderr, "Error: bpf_map_update_elem failed for prog array map\n");
 				return 1;
 			}
-		}
+		} printf("Reached line 288\n");
 
 		if (progs[i].pin) {
 			int len = snprintf(filename, PATH_MAX, "%s/%s", BPF_SYSFS_ROOT, progs[i].name);
@@ -310,7 +314,7 @@ retry:
 				return -1;
 			}
 		}
-	}
+	} printf("Reached line 313\n"); 
 
 	map_stats_fd = bpf_object__find_map_fd_by_name(obj, "map_stats");
 	if (map_stats_fd < 0) {

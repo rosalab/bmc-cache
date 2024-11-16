@@ -117,73 +117,91 @@ static inline __u16 compute_ip_checksum(struct iphdr *ip)
 SEC("bmc_rx_filter")
 int bmc_rx_filter_main(struct xdp_md *ctx)
 {
-	void *data_end = (void *)(long)ctx->data_end;
-	void *data = (void *)(long)ctx->data;
-	struct ethhdr *eth = data;
-	struct iphdr *ip = data + sizeof(*eth);
-	void *transp = data + sizeof(*eth) + sizeof(*ip);
-	struct udphdr *udp;
-	struct tcphdr *tcp;
-	char *payload;
-	__be16 dport;
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data = (void *)(long)ctx->data;
+    struct ethhdr *eth;
+    struct iphdr *ip;
+    struct udphdr *udp;
+    struct tcphdr *tcp;
+    void *transp;
+    __u8 *payload;
+    __be16 dport;
 
-	if (ip + 1 > data_end)
-		return XDP_PASS;
+    // Check Ethernet header
+    if (data + sizeof(*eth) > data_end)
+        return XDP_PASS;
+    eth = data;
 
-	switch (ip->protocol) {
-		case IPPROTO_UDP:
-			udp = (struct udphdr *) transp;
-			if (udp + 1 > data_end)
-				return XDP_PASS;
-			dport = udp->dest;
-			payload = transp + sizeof(*udp) + sizeof(struct memcached_udp_header);
-			break;
-		case IPPROTO_TCP:
-			tcp = (struct tcphdr *) transp;
-			if (tcp + 1 > data_end)
-				return XDP_PASS;
-			dport = tcp->dest;
-			payload = transp + sizeof(*tcp);
-			break;
-		default:
-			return XDP_PASS;
-	}
+    // Check IP header
+    if (data + sizeof(*eth) + sizeof(*ip) > data_end)
+        return XDP_PASS;
+    ip = (struct iphdr *)(eth + 1);
 
-	if (dport == htons(11211) && payload+4 <= data_end) {
+    // Check transport layer header
+    transp = (void *)ip + sizeof(*ip);
+    switch (ip->protocol) {
+        case IPPROTO_UDP:
+            if (transp + sizeof(*udp) > data_end)
+                return XDP_PASS;
+            udp = transp;
+            dport = udp->dest;
+            payload = transp + sizeof(*udp) + sizeof(struct memcached_udp_header);
+            break;
+        case IPPROTO_TCP:
+            if (transp + sizeof(*tcp) > data_end)
+                return XDP_PASS;
+            tcp = transp;
+            dport = tcp->dest;
+            payload = transp + sizeof(*tcp);
+            break;
+        default:
+            return XDP_PASS;
+    }
 
-		if (ip->protocol == IPPROTO_UDP && payload[0] == 'g' && payload[1] == 'e' && payload[2] == 't' && payload[3] == ' ') { // is this a GET request
-			unsigned int zero = 0;
-			struct bmc_stats *stats = bpf_map_lookup_elem(&map_stats, &zero);
-			if (!stats) {
-				return XDP_PASS;
-			}
-			stats->get_recv_count++;
+    // Check if it's a Memcached packet
+    if (dport != htons(11211) || payload + 4 > data_end)
+        return XDP_PASS;
 
-			struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &zero);
-			if (!pctx) {
-				return XDP_PASS;
-			}
-			pctx->key_count = 0;
-			pctx->current_key = 0;
-			pctx->write_pkt_offset = 0;
+    if (ip->protocol == IPPROTO_UDP) {
+      
+            __u32 zero = 0;
+	    struct bmc_stats *stats = bpf_map_lookup_elem(&map_stats, &zero);
+     	if(!stats) return XDP_PASS;
+	stats->get_recv_count++;	
+	    // Check if it's a GET request
+        if (payload[0] == 'g' && payload[1] == 'e' && payload[2] == 't' && payload[3] == ' ') {
 
-			unsigned int off;
-#pragma clang loop unroll(disable)
-			for (off = 4; off < BMC_MAX_PACKET_LENGTH && payload+off+1 <= data_end && payload[off] == ' '; off++) {} // move offset to the start of the first key
-			if (off < BMC_MAX_PACKET_LENGTH) {
-				pctx->read_pkt_offset = off; // save offset
-				if (bpf_xdp_adjust_head(ctx, (int)(sizeof(*eth) + sizeof(*ip) + sizeof(*udp) + sizeof(struct memcached_udp_header) + off))) { // push headers + 'get ' keyword
-					return XDP_PASS;
-				}
-				bpf_tail_call(ctx, &map_progs_xdp, BMC_PROG_XDP_HASH_KEYS);
-			}
-		}
-		else if (ip->protocol == IPPROTO_TCP) {
-			bpf_tail_call(ctx, &map_progs_xdp, BMC_PROG_XDP_INVALIDATE_CACHE);
-		}
-	}
+            struct parsing_context *pctx = bpf_map_lookup_elem(&map_parsing_context, &zero);
+            if (!pctx)
+                return XDP_PASS;
+            pctx->key_count = 0;
+            pctx->current_key = 0;
+            pctx->write_pkt_offset = 0;
 
-	return XDP_PASS;
+            // Find the start of the first key
+            __u32 off;
+            #pragma clang loop unroll(full)
+            for (off = 4; off < BMC_MAX_PACKET_LENGTH && off < 64; off++) {
+                if (payload + off >= data_end)
+                    return XDP_PASS;
+                if (payload[off] != ' ')
+                    break;
+            }
+
+            if (off < BMC_MAX_PACKET_LENGTH && off < 64) {
+                pctx->read_pkt_offset = off;
+                int adjust_len = sizeof(*eth) + sizeof(*ip) + sizeof(*udp) + 
+                                 sizeof(struct memcached_udp_header) + off;
+                if (bpf_xdp_adjust_head(ctx, adjust_len) == 0) {
+                    bpf_tail_call(ctx, &map_progs_xdp, BMC_PROG_XDP_HASH_KEYS);
+                }
+            }
+        }
+    } else if (ip->protocol == IPPROTO_TCP) {
+        bpf_tail_call(ctx, &map_progs_xdp, BMC_PROG_XDP_INVALIDATE_CACHE);
+    }
+
+    return XDP_PASS;
 }
 
 
@@ -210,8 +228,6 @@ int bmc_hash_keys_main(struct xdp_md *ctx)
 	key->hash = FNV_OFFSET_BASIS_32;
 
 	unsigned int off, done_parsing = 0, key_len = 0;
-
-	// compute the key hash
 #pragma clang loop unroll(disable)
 	for (off = 0; off < BMC_MAX_KEY_LENGTH+1 && payload+off+1 <= data_end; off++) {
 		if (payload[off] == '\r') {
@@ -222,11 +238,12 @@ int bmc_hash_keys_main(struct xdp_md *ctx)
 			break;
 		}
 		else if (payload[off] != ' ') {
-			key->hash ^= payload[off];
+		/*	key->hash ^= payload[off];
 			key->hash *= FNV_PRIME_32;
-			key_len++;
+			key_len++; */
 		}
 	}
+
 
 	if (key_len == 0 || key_len > BMC_MAX_KEY_LENGTH) {
 		bpf_xdp_adjust_head(ctx, 0 - (sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + sizeof(struct memcached_udp_header) + pctx->read_pkt_offset)); // unexpected key, let the netstack handle it
@@ -466,7 +483,7 @@ int bmc_invalidate_cache_main(struct xdp_md *ctx)
 				key_found = 0;
 			} else { // found the start of the key
 				hash = FNV_OFFSET_BASIS_32;
-				hash ^= payload[off];
+				hash *= payload[off];
 				hash *= FNV_PRIME_32;
 				key_found = 1;
 			}
@@ -488,7 +505,7 @@ int bmc_invalidate_cache_main(struct xdp_md *ctx)
 				key_found = 0;
 			}
 			else { // still processing the key
-				hash ^= payload[off];
+				hash *= payload[off];
 				hash *= FNV_PRIME_32;
 			}
 		}
@@ -551,7 +568,7 @@ int bmc_update_cache_main(struct __sk_buff *skb)
 	// compute the key hash
 #pragma clang loop unroll(disable)
 	for (unsigned int off = 6; off-6 < BMC_MAX_KEY_LENGTH && payload+off+1 <= data_end && payload[off] != ' '; off++) {
-		hash ^= payload[off];
+		hash *= payload[off];
 		hash *= FNV_PRIME_32;
 	}
 
@@ -604,5 +621,5 @@ int bmc_update_cache_main(struct __sk_buff *skb)
 
 	return TC_ACT_OK;
 }
-
+char _license[] SEC("license") = "GPL";
 // to test colisions: keys declinate0123456 and macallums0123456 have hash colision
