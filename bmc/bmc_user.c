@@ -48,7 +48,7 @@ static struct bpf_progs_desc progs[] = {
 	{"bmc_invalidate_cache", BPF_PROG_TYPE_XDP, 0, BMC_PROG_XDP_INVALIDATE_CACHE, NULL},
 
 	{"bmc_tx_filter", BPF_PROG_TYPE_SCHED_CLS, 1, -1, NULL},
-	{"bmc_update_cache", BPF_PROG_TYPE_SCHED_CLS, 0, BMC_PROG_TC_UPDATE_CACHE, NULL},
+	{"bmc_update_cache", BPF_PROG_TYPE_XDP, 0, BMC_PROG_TC_UPDATE_CACHE, NULL},
 };
 
 uint32_t fnv1a_hash32(char *key, size_t length, uint32_t hash)
