@@ -62,6 +62,7 @@ uint32_t fnv1a_hash32(char *key, size_t length, uint32_t hash)
 
 int write_stats_to_file(char *filename, int map_fd)
 {
+	printf("Writing stats to %s file...", filename);
 	struct bmc_stats stats[nr_cpus];
 	struct bmc_stats aggregate_stats;
 	__u32 key = 0;
