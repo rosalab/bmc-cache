@@ -362,12 +362,13 @@ int bmc_write_reply_main(struct xdp_md *ctx)
 	}
 
 	unsigned int cache_hit = 1, written = 0;
-//	bpf_printk("Key len: %d, key hash: %d, key: %s", key->len, key->hash, key->data);
 	__u32 cache_idx = key->hash % BMC_CACHE_ENTRY_COUNT;
 	struct bmc_cache_entry *entry = bpf_map_lookup_elem(&map_kcache, &cache_idx);
 	if (!entry) {
 		return XDP_DROP;
 	}
+
+//	bpf_printk("Key len: %d, key hash: %d, key: %s, entry->hash: %d, entry->len: %d", key->len, key->hash, key->data, entry->hash, entry->len);
 	bpf_spin_lock(&entry->lock);
 	if (entry->valid && key->hash == entry->hash) { // if saved key still matches its corresponding cache entry
 #pragma clang loop unroll(disable)
@@ -416,7 +417,7 @@ int bmc_write_reply_main(struct xdp_md *ctx)
 													+ sizeof(struct memcached_udp_header) + pctx->write_pkt_offset))) { // pop headers + previously written data
 				return XDP_DROP;
 			}
-
+			// bpf_printk("Final payload: %s", payload);
 			void *data_end = (void *)(long)ctx->data_end;
 			void *data = (void *)(long)ctx->data;
 			struct iphdr *ip = data + sizeof(struct ethhdr);
@@ -501,13 +502,23 @@ int bmc_invalidate_cache_main(struct xdp_md *ctx)
 		bpf_spin_lock(&entry->lock);
 		entry->data[0] = 'V'; entry->data[1] = 'A'; entry->data[2] = 'L'; entry->data[3] = 'U'; entry->data[4] = 'E'; entry->data[5] = ' ';	
 		unsigned int offset = 6;
-		//TODO: remove the extra data [value expiration] from payload prefore storing
+		bool space_found = false;
+		unsigned int j = 4;
 #pragma clang loop unroll(disable)
-		for(unsigned int j = 4; offset<BMC_MAX_CACHE_DATA_SIZE && payload+j+1 <= data_end && count<2; j++) {	
+		for(; offset<BMC_MAX_CACHE_DATA_SIZE && payload+j+1 <= data_end && payload[j]!= ' '; j++) {entry->data[offset] = payload[j]; offset+=1;}
+
+		if(offset + 3 < BMC_MAX_CACHE_DATA_SIZE){
+		entry->data[offset] = ' ';
+		entry->data[offset+1] = '0';
+		entry->data[offset+2] = ' '; 
+		offset += 3;}
+#pragma clang loop unroll(disable)
+		for(j = j+5; offset<BMC_MAX_CACHE_DATA_SIZE && payload+j+1 <= data_end && count<2; j++) {	
 			entry->data[offset] = payload[j];
 			offset += 1;
 			if(payload[j] == '\n') count++;
 		}
+		entry->len = offset;
 		if(count == 2) {
 			entry->valid = 1;
 			entry->hash = hash;
