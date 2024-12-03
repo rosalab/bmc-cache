@@ -762,6 +762,7 @@ typedef struct {
     uint32_t proxy_rng[4]; // fast per-thread rng for lua.
     // TODO: add ctx object so we can attach to queue.
 #endif
+    int persistence_fd; // file descriptor for saving SET commands to /tmp/memcached/thread_<thread-id>_persisence.log
 } LIBEVENT_THREAD;
 
 /**
