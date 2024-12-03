@@ -1151,8 +1151,8 @@ void memcached_thread_init(int nthreads, void *arg) {
         /* Reserve three fds for the libevent base, and two for the pipe */
         stats_state.reserved_fds += 5;
 
-	char filename[64];
-	snprintf(filename, sizeof(filename), "/home/skavya/bmc-cache/memcached-persistence/thread_%d_persistence.log", i);
+	char filename[100];
+	snprintf(filename, sizeof(filename), "/home/skavya/bmc-cache/memcached-persistence/%d.log", i);
 	threads[i].persistence_fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if(threads[i].persistence_fd < 0) {
 		fprintf(stderr, "Unable to open file: %s\n", filename);

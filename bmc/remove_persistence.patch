@@ -1,0 +1,41 @@
+diff --git a/bmc/bmc_kern.c b/bmc/bmc_kern.c
+index eaa669a..4eae822 100644
+--- a/bmc/bmc_kern.c
++++ b/bmc/bmc_kern.c
+@@ -38,8 +38,9 @@ struct memcached_udp_header {
+ */
+ 
+ /* cache */
++
+ struct {
+-	__uint(type, BPF_MAP_TYPE_CC_ARRAY);
++	__uint(type, BPF_MAP_TYPE_ARRAY);
+ 	__type(key, __u32);
+ 	__type(value, struct bmc_cache_entry);
+ 	__uint(max_entries, BMC_CACHE_ENTRY_COUNT);
+@@ -417,7 +418,6 @@ int bmc_write_reply_main(struct xdp_md *ctx)
+ 													+ sizeof(struct memcached_udp_header) + pctx->write_pkt_offset))) { // pop headers + previously written data
+ 				return XDP_DROP;
+ 			}
+-			// bpf_printk("Final payload: %s", payload);
+ 			void *data_end = (void *)(long)ctx->data_end;
+ 			void *data = (void *)(long)ctx->data;
+ 			struct iphdr *ip = data + sizeof(struct ethhdr);
+@@ -523,7 +523,7 @@ int bmc_invalidate_cache_main(struct xdp_md *ctx)
+ 			entry->valid = 1;
+ 			entry->hash = hash;
+ 			bpf_spin_unlock(&entry->lock);
+-			bpf_ccmap_persist_elem(&map_kcache, &cache_idx, ctx, BPF_ANY);
++			//bpf_ccmap_persist_elem(&map_kcache, &cache_idx, ctx, BPF_ANY);
+ 			stats->update_count++;
+ 			bpf_tail_call(ctx, &map_progs_xdp, BMC_PROG_XDP_WRITE_SET_REPLY);
+ 		} else {
+@@ -575,7 +575,7 @@ int bmc_write_set_reply_main(struct xdp_md *ctx)
+     udp->len = htons((payload+8) - (char*)udp);
+ 
+    // bpf_printk("Returning UDP packet | payload: %s", payload);
+-    return XDP_TX_PERSIST;
++ 	return XDP_TX;
+ }
+ 
+ SEC("bmc_tx_filter")

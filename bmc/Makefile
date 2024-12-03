@@ -14,7 +14,7 @@
 #	bmc_kern.c depends on kernel headers and bpf_helpers.h
 #	bmc_user.c depends on libbpf
 
-LINUX_PATH ?= ./linux
+LINUX_PATH ?= ../linux
 LINUX_TOOLS_PATH = $(LINUX_PATH)/tools
 LINUX_LIB_PATH = $(LINUX_TOOLS_PATH)/lib
 LIBBPF_PATH = $(LINUX_LIB_PATH)/bpf
@@ -118,7 +118,7 @@ $(LIBBPF): $(wildcard $(LIBBPF_PATH)/*.[ch] $(LIBBPF_PATH)/Makefile)
 #
 $(KERN_OBJECTS): %.o: %.c
 	$(CLANG) -S $(NOSTDINC_FLAGS) $(LINUXINCLUDE) $(EXTRA_CFLAGS) \
-	    -D__KERNEL__ -D__ASM_SYSREG_H -D__BPF_TRACING__ \
+	    -D__KERNEL__ -D__ASM_SYSREG_H -D__BPF_TRACING__ -DKBUILD_MODNAME=\"BMC\"\
 	    -D__TARGET_ARCH_$(ARCH) \
 	    -Wno-unused-value -Wno-pointer-sign \
 	    -Wno-compare-distinct-pointer-types \
