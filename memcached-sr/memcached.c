@@ -62,6 +62,9 @@
 #include <sys/sysctl.h>
 #endif
 
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdint.h>
 /*
  * forward declarations
  */
@@ -1758,6 +1761,30 @@ enum store_item_type do_store_item(item *it, int comm, LIBEVENT_THREAD *t, const
     if (stored == STORED && cas != NULL) {
         *cas = ITEM_get_cas(it);
     }
+   
+    // persist the stored data 
+    if(stored == STORED) {
+	    struct item_header {
+		uint32_t key_length;
+		uint32_t data_length;
+		uint32_t hash_value;
+		uint32_t flags;
+	    } header;
+
+	    header.key_length = it->nkey;
+	    header.data_length = it->nbytes;
+	    header.hash_value = hv;
+	    header.flags = it->it_flags;
+
+	    int fd = t->persistence_fd;
+    	    assert(fd >= 0); // double check if the file descriptor is fine
+
+	    write(fd, &header, sizeof(header));        // Write header
+	    write(fd, it->data, it->nbytes);          // Write data
+
+	    fsync(fd); // flush writes to dish before returning
+    }
+
     LOGGER_LOG(t->l, LOG_MUTATIONS, LOGGER_ITEM_STORE, NULL,
             stored, comm, ITEM_key(it), it->nkey, it->nbytes, it->exptime,
             ITEM_clsid(it), t->cur_sfd);
@@ -4066,7 +4093,7 @@ static void verify_default(const char* param, bool condition) {
 
 static void usage(void) {
     printf(PACKAGE " " VERSION "\n");
-    printf("-p, --port=<num>          TCP port to listen on (default: %d)\n"
+    printf("-p, --port=<num>          TCP port to will now listen on (default: %d)\n"
            "-U, --udp-port=<num>      UDP port to listen on (default: %d, off)\n",
            settings.port, settings.udpport);
 #ifndef DISABLE_UNIX_SOCKET
@@ -4254,7 +4281,7 @@ static void usage(void) {
     verify_default("ssl_verify_mode", settings.ssl_verify_mode == SSL_VERIFY_NONE);
     verify_default("ssl_min_version", settings.ssl_min_version == TLS1_2_VERSION);
 #endif
-    printf("-N, --napi_ids            number of napi ids. see doc/napi_ids.txt for more details\n");
+    printf("-N, --napi_ids            [modified] number of napi ids. see doc/napi_ids.txt for more details\n");
     return;
 }
 
