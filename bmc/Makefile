@@ -119,7 +119,7 @@ $(LIBBPF): $(wildcard $(LIBBPF_PATH)/*.[ch] $(LIBBPF_PATH)/Makefile)
 $(KERN_OBJECTS): %.o: %.c
 	$(CLANG) -S $(NOSTDINC_FLAGS) $(LINUXINCLUDE) $(EXTRA_CFLAGS) \
 	    -D__KERNEL__ -D__ASM_SYSREG_H -D__BPF_TRACING__ \
-	    -D__TARGET_ARCH_$(ARCH) \
+	    -D__TARGET_ARCH_$(ARCH) -DKBUILD_MODNAME=\"bmc\" \
 	    -Wno-unused-value -Wno-pointer-sign \
 	    -Wno-compare-distinct-pointer-types \
 	    -Wno-gnu-variable-sized-type-not-at-end \

@@ -14,7 +14,6 @@
 
 #include "linux/bpf.h"
 #include "linux/in.h"
-#include "linux/include/linux/byteorder/generic.h"
 #include <linux/string.h>
 #include "linux/pkt_cls.h"
 
