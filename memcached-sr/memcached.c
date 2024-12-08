@@ -81,6 +81,9 @@ enum try_read_result {
     READ_MEMORY_ERROR      /** failed to allocate more memory */
 };
 
+static int persist_fd = 0;
+static pthread_mutex_t persist_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static int try_read_command_negotiate(conn *c);
 static int try_read_command_udp(conn *c);
 
@@ -1776,13 +1779,13 @@ enum store_item_type do_store_item(item *it, int comm, LIBEVENT_THREAD *t, const
 	    header.hash_value = hv;
 	    header.flags = it->it_flags;
 
-	    int fd = t->persistence_fd;
-    	    assert(fd >= 0); // double check if the file descriptor is fine
+    	    assert(persist_fd >= 0); // double check if the file descriptor is fine
 
-	    write(fd, &header, sizeof(header));        // Write header
-	    write(fd, it->data, it->nbytes);          // Write data
-
-	    fsync(fd); // flush writes to dish before returning
+	    pthread_mutex_lock(&persist_lock); 
+	    write(persist_fd,  &header, sizeof(header));        // Write header
+	    write(persist_fd, it->data, it->nbytes);          // Write data
+	    fsync(persist_fd); // flush writes to dish before returning
+	    pthread_mutex_unlock(&persist_lock);
     }
 
     LOGGER_LOG(t->l, LOG_MUTATIONS, LOGGER_ITEM_STORE, NULL,
@@ -4814,6 +4817,17 @@ static int _mc_meta_load_cb(const char *tag, void *ctx, void *data) {
 }
 
 int main (int argc, char **argv) {
+
+
+	// persistence file open
+    char filename[100] = "./persist_memc/wal.log";
+    persist_fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if(persist_fd < 0) {
+	fprintf(stderr, "Unable to open file: %s\n", filename);
+	perror("Error");
+	exit(1);
+    }
+
     int c;
     bool lock_memory = false;
     bool do_daemonize = false;
